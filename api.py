@@ -1,0 +1,3128 @@
+from fastapi import FastAPI, HTTPException, File, UploadFile, WebSocket, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from pydantic import BaseModel
+from brain import ask_gpt_or_generate_meme
+import asyncio
+from openai import OpenAI, OpenAIError
+import os
+import io
+import numpy as np
+import soundfile as sf
+import note_seq
+import tempfile
+import pretty_midi
+from music21 import *
+import pytesseract
+from pdf2image import convert_from_path
+import cv2
+import base64
+from typing import Optional, List, Dict, Any, Tuple, Union
+from dataclasses import dataclass
+import json
+import re
+import random
+
+# Magenta imports
+from magenta.models.melody_rnn import melody_rnn_sequence_generator
+from magenta.models.drums_rnn import drums_rnn_sequence_generator
+from magenta.models.music_vae import configs as vae_configs
+from magenta.models.music_vae import TrainedModel
+from magenta.models.shared import sequence_generator_bundle
+from magenta.music import sequences_lib
+from magenta.music import midi_io
+from magenta.music import audio_io
+from magenta.music import constants
+from magenta.music import midi_synth
+from magenta.music import musicnet_io
+from magenta.models.improv_rnn import improv_rnn_sequence_generator
+import note_seq.protobuf.generator_pb2
+
+import tensorflow as tf
+import librosa
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Get API key from environment
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    print("\n⚠️  Warning: OPENAI_API_KEY environment variable not found!")
+    # Use the key from brain.py as fallback
+    API_KEY = "REDACTED_OPENAI_KEY"
+
+try:
+    client = OpenAI(
+        api_key=API_KEY,
+        max_retries=1,
+        timeout=15.0
+    )
+except Exception as e:
+    print(f"\n❌ Error initializing OpenAI client: {str(e)}")
+    raise
+
+app = FastAPI()
+
+# Add this function before initialize_models()
+def get_bundle_file(filename):
+    """Get the path to a bundle file."""
+    bundle_dir = os.path.join(os.path.dirname(__file__), 'bundles')
+    if not os.path.exists(bundle_dir):
+        os.makedirs(bundle_dir)
+    return os.path.join(bundle_dir, filename)
+
+# Initialize Magenta models
+def initialize_models():
+    """Initialize all required Magenta models"""
+    try:
+        print("\nInitializing Magenta models...")
+
+        # Initialize melody generator
+        print("Loading melody model...")
+        melody_bundle = sequence_generator_bundle.read_bundle_file(get_bundle_file('attention_rnn.mag'))
+        melody_generator = melody_rnn_sequence_generator.MelodyRnnSequenceGenerator(
+            model=note_seq.protobuf.generator_pb2.GeneratorDetails(),
+            details=melody_bundle.generator_details,
+            steps_per_quarter=4,
+            checkpoint=None,
+            bundle=melody_bundle
+        )
+
+        # Initialize drums generator
+        print("Loading drums model...")
+        drums_bundle = sequence_generator_bundle.read_bundle_file(get_bundle_file('drum_kit_rnn.mag'))
+        drums_generator = drums_rnn_sequence_generator.DrumsRnnSequenceGenerator(
+            model=note_seq.protobuf.generator_pb2.GeneratorDetails(),
+            details=drums_bundle.generator_details,
+            steps_per_quarter=4,
+            checkpoint=None,
+            bundle=drums_bundle
+        )
+
+        # Initialize MusicVAE with reduced batch size and memory usage
+        print("Loading MusicVAE model...")
+        music_vae_config = vae_configs.CONFIG_MAP['cat-mel_2bar_big']
+        music_vae = TrainedModel(
+            config=music_vae_config,
+            batch_size=1,  # Reduced from 4 to 1
+            checkpoint_dir_or_path=get_bundle_file('cat-mel_2bar_big.tar')
+        )
+
+        # For now, we'll use MusicVAE instead of Piano Genie
+        piano_genie = music_vae
+
+        # Using melody generator for improvisation
+        improv_generator = melody_generator
+
+        print("\n✅ All models initialized successfully!")
+        return melody_generator, drums_generator, music_vae, piano_genie, improv_generator
+
+    except Exception as e:
+        print(f"\n❌ Error initializing models: {str(e)}")
+        print("\nDebug info:")
+        bundle_files = ['attention_rnn.mag', 'drum_kit_rnn.mag', 'cat-mel_2bar_big.tar']
+        for file in bundle_files:
+            path = get_bundle_file(file)
+            exists = os.path.exists(path)
+            size = os.path.getsize(path) if exists else 0
+            print(f"{file}: {'✓' if exists else '✗'} (Size: {size} bytes)")
+        raise
+
+melody_model, drums_model, vae_model, piano_genie, improv_model = initialize_models()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+class Message(BaseModel):
+    """Message model for completions"""
+    text: str
+
+class MusicAnalysis(BaseModel):
+    melody: List[Dict[str, Any]]
+    harmony: List[Dict[str, Any]]
+    form: Dict[str, Any]
+    style_markers: List[str]
+    suggested_concepts: List[str]
+    key: str
+    time_signature: str
+    visualization: Dict[str, Any]
+
+class GenerationParams(BaseModel):
+    tempo: int = 120
+    prompt: str = "251"  # Default to a 2-5-1 progression
+    style: Optional[str] = "swing"
+    length: int = 4  # bars
+    complexity: float = 0.5
+
+class ChordProgression(BaseModel):
+    name: str
+    chords: List[str]
+    tempo: int = 120
+    style: str = "swing"
+
+class SubstitutionRequest(BaseModel):
+    chord: str
+    substitution_type: str  # e.g., "tritone", "diminished", "upper_structure"
+    context: Optional[Dict[str, Any]] = None
+
+class MusicalExample(BaseModel):
+    concept: str
+    context: Optional[Dict[str, Any]] = None
+    length: int = 4  # bars
+
+# Expanded jazz standards and patterns database
+JAZZ_STANDARDS = {
+    "blues": {
+        "name": "Basic Blues",
+        "form": "12-bar",
+        "style": "swing",
+        "changes": ["I7", "I7", "I7", "I7",
+                   "IV7", "IV7", "I7", "I7",
+                   "V7", "IV7", "I7", "V7"]
+    },
+    "rhythm_changes": {
+        "name": "Rhythm Changes",
+        "form": "AABA",
+        "style": "swing",
+        "changes": ["Bbmaj7", "G7", "Cm7", "F7",
+                   "Bbmaj7", "G7", "Cm7", "F7",
+                   "Cm7", "F7", "Bb7", "Eb7",
+                   "Cm7", "F7", "Bbmaj7", "F7"]
+    },
+    "251": {
+        "name": "2-5-1 Progression",
+        "form": "4-bar",
+        "style": "swing",
+        "changes": ["Dm7", "G7", "Cmaj7", "Cmaj7"]
+    },
+    "minor251": {
+        "name": "Minor 2-5-1",
+        "form": "4-bar",
+        "style": "swing",
+        "changes": ["Dm7b5", "G7b9", "Cm7", "Cm7"]
+    },
+    "inner_urge": {
+        "name": "Inner Urge",
+        "form": "AABA",
+        "style": "latin",
+        "changes": ["Fmaj7", "F#maj7", "Bmaj7", "Emaj7",
+                   "Fmaj7", "F#maj7", "Bmaj7", "Emaj7",
+                   "Am7", "D7", "Gmaj7", "Cmaj7",
+                   "Fmaj7", "F#maj7", "Bmaj7", "Emaj7"]
+    }
+}
+
+from brain import music_analyzer
+
+def get_key(response_text: str) -> str:
+    """Extract key from response text"""
+    try:
+        key_match = re.search(r'DBKeySig = (.+)', response_text)
+        return key_match.group(1).strip() if key_match else "C"
+    except:
+        return "C"
+
+def get_time_signature(response_text: str) -> str:
+    """Extract time signature from response text"""
+    try:
+        time_match = re.search(r'TimeSig = (\d+) (\d+)', response_text)
+        return f"{time_match.group(1)}/{time_match.group(2)}" if time_match else "4/4"
+    except:
+        return "4/4"
+
+def get_bars(response_text: str) -> int:
+    """Extract number of bars from response text"""
+    try:
+        bars_match = re.search(r'Bars = (\d+)', response_text)
+        return int(bars_match.group(1)) if bars_match else 4
+    except:
+        return 4
+
+def get_tempo(response_text: str) -> int:
+    """Extract tempo from response text"""
+    try:
+        tempo_match = re.search(r'Tempo = (\d+)', response_text)
+        return int(tempo_match.group(1)) if tempo_match else 120
+    except:
+        return 120
+
+async def interpret_prompt(prompt: str) -> Tuple[List[Union[str, Tuple[str, float]]], str]:
+    """Interpret a text prompt into a chord progression"""
+    try:
+        # Extract style information
+        style_pattern = r'(?:in|with)?\s*([\w\s]+?)\s*(?:style|feel)'
+        style_match = re.search(style_pattern, prompt, re.IGNORECASE)
+        style = style_match.group(1).strip() if style_match else "swing"
+
+        # First try to load from corpus
+        corpus_result = music_analyzer.load_from_corpus(prompt)
+        if corpus_result:
+            print("Found in corpus, using that progression")
+            return parse_corpus_progression(corpus_result), style
+
+        # If not in corpus, get response from GPT with a timeout
+        try:
+            response_text = await asyncio.wait_for(
+                music_analyzer.analyze_music(prompt),
+                timeout=10.0  # 10 second timeout
+            )
+        except asyncio.TimeoutError:
+            print("GPT response timed out, using fallback progression")
+            return [("Dm7", 4.0), ("G7", 4.0), ("Cmaj7", 4.0), ("Cmaj7", 4.0)], style
+
+        print("\nRaw Response:")
+        print("=" * 80)
+        print(response_text)
+        print("=" * 80)
+
+        # Parse the response
+        progression = []
+        total_bars = 0
+
+        # Get tempo from response
+        tempo = get_tempo(response_text)
+
+        # Split into lines and find the chord progression
+        lines = response_text.split('\n')
+        for line in lines:
+            if '|' in line and not line.startswith(('Title', 'Key', 'Time')):
+                # Split into bars
+                bars = [bar.strip() for bar in line.split('|') if bar.strip()]
+
+                for bar in bars:
+                    # Split chords in this bar
+                    chords = [c.strip() for c in bar.split() if c.strip()]
+                    num_chords = len(chords)
+
+                    # Calculate beats per chord (4 beats per bar divided equally)
+                    if num_chords > 0:
+                        beats_per_chord = round(4.0 / num_chords, 2)  # Round to 2 decimal places
+                        for chord in chords:
+                            progression.append((chord, beats_per_chord))
+
+                    total_bars += 1
+
+        print("\nParsed Progression:")
+        print("-" * 80)
+        print(f"Title: {prompt}")
+        print(f"Key: {get_key(response_text)}")
+        print(f"Time: {get_time_signature(response_text)}")
+        print(f"Tempo: {tempo}")
+        print(f"Total bars: {total_bars}")
+        print("Changes:")
+        for chord, beats in progression:
+            print(f"{chord}: {beats} beats")
+        print("-" * 80)
+
+        if not progression:
+            print("No valid progression found, using 251 as fallback")
+            return [("Dm7", 4.0), ("G7", 4.0), ("Cmaj7", 4.0), ("Cmaj7", 4.0)], style
+
+        return progression, style
+
+    except Exception as e:
+        print(f"Error in interpret_prompt: {str(e)}")
+        return [("Dm7", 4.0), ("G7", 4.0), ("Cmaj7", 4.0), ("Cmaj7", 4.0)], "swing"
+
+def parse_corpus_progression(corpus_text: str) -> List[Tuple[str, float]]:
+    """Parse a progression from corpus format into our internal format"""
+    progression = []
+    lines = corpus_text.split('\n')
+
+    for line in lines:
+        if '|' in line and not line.startswith(('Title', 'Key', 'Time')):
+            # Split into bars
+            bars = [bar.strip() for bar in line.split('|') if bar.strip()]
+
+            for bar in bars:
+                # Split chords in this bar
+                chords = [c.strip() for c in bar.split() if c.strip()]
+                num_chords = len(chords)
+
+                # Calculate beats per chord (4 beats per bar divided equally)
+                if num_chords > 0:
+                    beats_per_chord = round(4.0 / num_chords, 2)  # Round to 2 decimal places
+                    for chord in chords:
+                        progression.append((chord, beats_per_chord))
+
+    return progression
+
+def create_blues_progression(key: str) -> List[str]:
+    """Create a blues progression in the specified key"""
+    # Get the root note number
+    root = pretty_midi.note_name_to_number(key + "4")
+    root_name = key
+
+    # Calculate IV and V
+    fourth = (root + 5) % 12
+    fifth = (root + 7) % 12
+
+    # Convert back to note names
+    fourth_name = pretty_midi.note_number_to_name(fourth + 60)[:-1]  # Remove octave number
+    fifth_name = pretty_midi.note_number_to_name(fifth + 60)[:-1]  # Remove octave number
+
+    # Create the progression
+    return [
+        f"{root_name}7", f"{root_name}7", f"{root_name}7", f"{root_name}7",
+        f"{fourth_name}7", f"{fourth_name}7", f"{root_name}7", f"{root_name}7",
+        f"{fifth_name}7", f"{fourth_name}7", f"{root_name}7", f"{fifth_name}7"
+    ]
+
+class MusicRequest(BaseModel):
+    text: str
+    type: str = "chat"  # "chat" or "voice"
+    context: Optional[Dict[str, Any]] = None
+    room_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+class MusicResponse(BaseModel):
+    text: str
+    audio: Optional[str] = None  # Base64 encoded audio if applicable
+    analysis: Optional[Dict[str, Any]] = None
+    visualization: Optional[Dict[str, Any]] = None
+    next_steps: Optional[List[str]] = None
+
+class JazzAnalysis(BaseModel):
+    chords: List[str]
+    key: str
+    form: str
+    tempo: float
+    measures: List[Dict[str, str]]
+    style: str
+    suggested_scales: List[str]
+    chord_progression: Optional[List[str]] = None
+
+# Intent classification for music requests
+MUSIC_INTENTS = {
+    "play_changes": ["play", "hear", "listen", "changes", "progression"],
+    "analyze_tune": ["analyze", "understand", "explain", "theory", "theoretical"],
+    "practice_help": ["practice", "exercise", "drill", "work on"],
+    "demonstration": ["demonstrate", "show", "example", "like"],
+    "substitution": ["substitute", "reharmonize", "reharmonization", "change"],
+}
+
+@app.post("/process-music-request")
+async def process_music_request(request: MusicRequest):
+    """Process a natural language music request"""
+    try:
+        # First, use the brain to understand the musical intent
+        intent_query = await ask_gpt_or_generate_meme(
+            f"What is the musical intent of this request: '{request.text}'? " +
+            "Consider: playing changes, analysis, practice help, demonstration, or substitution. " +
+            "Also extract any specific tune names, concepts, or musical elements mentioned."
+        )
+
+        # Parse the response to get intent and entities
+        intent, entities = parse_musical_intent(intent_query)
+
+        # Handle different types of requests
+        if intent == "play_changes":
+            return await handle_play_request(request.text, entities)
+        elif intent == "analyze_tune":
+            return await handle_analysis_request(request.text, entities)
+        elif intent == "practice_help":
+            return await handle_practice_request(request.text, entities)
+        elif intent == "demonstration":
+            return await handle_demonstration_request(request.text, entities)
+        elif intent == "substitution":
+            return await handle_substitution_request(request.text, entities)
+        else:
+            # Default to general music conversation
+            return await handle_general_music_request(request.text)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.websocket("/ws/music-chat")
+async def music_chat_websocket(websocket: WebSocket):
+    """WebSocket endpoint for real-time music chat interaction"""
+    try:
+        await websocket.accept()
+        print("WebSocket connection established")
+
+        while True:
+            try:
+                # Receive message from client
+                data = await websocket.receive_text()
+                print(f"Received WebSocket message: {data}")
+
+                request = MusicRequest(**json.loads(data))
+
+                # Process the request
+                response = await process_music_request(request)
+
+                # Send response back to client
+                await websocket.send_text(json.dumps(response.dict()))
+                print("Response sent successfully")
+
+            except WebSocketDisconnect:
+                print("WebSocket disconnected normally")
+                break
+            except json.JSONDecodeError as e:
+                print(f"Invalid JSON received: {str(e)}")
+                await websocket.send_text(json.dumps({
+                    "error": "Invalid JSON format",
+                    "details": str(e)
+                }))
+            except Exception as e:
+                print(f"Error processing WebSocket message: {str(e)}")
+                try:
+                    await websocket.send_text(json.dumps({
+                        "error": "Internal server error",
+                        "details": str(e)
+                    }))
+                except:
+                    print("Could not send error message to client")
+                break
+    except Exception as e:
+        print(f"WebSocket connection error: {str(e)}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+async def handle_play_request(text: str, entities: Dict[str, Any]) -> MusicResponse:
+    """Handle requests to play chord changes"""
+    tune_name = entities.get("tune_name")
+    if tune_name:
+        # Get the changes for the tune
+        progression = await get_standard_changes(tune_name)
+
+        # Create audio with the specified preferences
+        audio_data = await play_chord_progression(progression)
+
+        # Create response with both explanation and audio
+        return MusicResponse(
+            text=f"Here are the changes to {tune_name}. I'm playing them with {progression.style} feel at {progression.tempo} bpm.",
+            audio=encode_audio(audio_data),
+            analysis={
+                "progression": progression.dict(),
+                "form": progression.form if hasattr(progression, 'form') else None
+            },
+            next_steps=[
+                "Try playing along with the changes",
+                "Would you like to hear any specific substitutions?",
+                "I can demonstrate common scale choices for soloing"
+            ]
+        )
+    else:
+        return MusicResponse(
+            text="I didn't catch which tune you'd like to hear. Could you specify the tune name?",
+            next_steps=["You can ask for any jazz standard", "Or I can suggest some tunes to work on"]
+        )
+
+async def handle_analysis_request(text: str, entities: Dict[str, Any]) -> MusicResponse:
+    """Handle requests for musical analysis"""
+    tune_name = entities.get("tune_name")
+    concept = entities.get("concept")
+
+    if tune_name:
+        # Get the changes and analysis
+        progression = await get_standard_changes(tune_name)
+        analysis = await analyze_changes(progression)
+
+        # Generate musical examples for the analysis
+        examples = await generate_concept_example(concept or "harmony", {"progression": progression}, 4)
+
+        return MusicResponse(
+            text=f"Here's my analysis of {tune_name}",
+            audio=encode_audio(examples) if examples else None,
+            analysis=analysis,
+            visualization=create_chord_visualization(progression),
+            next_steps=[
+                "Would you like to hear specific sections?",
+                "I can demonstrate any of these concepts",
+                "We can explore common substitutions"
+            ]
+        )
+    else:
+        return MusicResponse(
+            text="What tune or concept would you like me to analyze?",
+            next_steps=["You can name any tune", "Or ask about specific concepts"]
+        )
+
+async def handle_practice_request(text: str, entities: Dict[str, Any]) -> MusicResponse:
+    """Handle requests for practice help"""
+    tune_name = entities.get("tune_name")
+    concept = entities.get("concept")
+
+    # Generate practice suggestions
+    suggestions = await ask_gpt_or_generate_meme(
+        f"Suggest practice exercises for {tune_name if tune_name else 'jazz'} " +
+        f"focusing on {concept if concept else 'general improvisation'}. " +
+        "Include specific musical exercises and approaches."
+    )
+
+    # Create musical examples for the exercises
+    examples = None
+    if tune_name:
+        progression = await get_standard_changes(tune_name)
+        examples = await generate_practice_examples(progression, concept)
+
+    return MusicResponse(
+        text=suggestions,
+        audio=encode_audio(examples) if examples else None,
+        next_steps=[
+            "Would you like me to demonstrate any of these exercises?",
+            "I can play them at different tempos",
+            "We can focus on specific sections"
+        ]
+    )
+
+async def handle_demonstration_request(text: str, entities: Dict[str, Any]) -> MusicResponse:
+    """Handle requests for musical demonstrations"""
+    concept = entities.get("concept")
+    tune_name = entities.get("tune_name")
+
+    # Get musical context if a tune is specified
+    context = {}
+    if tune_name:
+        progression = await get_standard_changes(tune_name)
+        context["progression"] = progression
+
+    # Generate the musical example
+    example = await generate_concept_example(concept, context, 4)
+
+    # Get explanation of the concept
+    explanation = await ask_gpt_or_generate_meme(
+        f"Explain how this musical example demonstrates {concept}, " +
+        f"{'in the context of ' + tune_name if tune_name else ''}. " +
+        "Focus on practical application and understanding."
+    )
+
+    return MusicResponse(
+        text=explanation,
+        audio=encode_audio(example),
+        visualization=create_concept_visualization(concept, context),
+        next_steps=[
+            "Would you like to hear it at a different tempo?",
+            "I can show variations of this concept",
+            "We can apply this to other tunes"
+        ]
+    )
+
+async def handle_substitution_request(text: str, entities: Dict[str, Any]) -> MusicResponse:
+    """Handle requests for chord substitutions"""
+    tune_name = entities.get("tune_name")
+    sub_type = entities.get("substitution_type")
+
+    if tune_name:
+        # Get original changes
+        progression = await get_standard_changes(tune_name)
+
+        # Create substitution demonstration
+        sub_request = SubstitutionRequest(
+            chord=progression.chords[0],  # Start with first chord
+            substitution_type=sub_type or "tritone",
+            context={"progression": progression}
+        )
+
+        substitution = await demonstrate_substitution(sub_request)
+
+        # Get explanation of the substitution
+        explanation = await ask_gpt_or_generate_meme(
+            f"Explain this {sub_type or 'tritone'} substitution in {tune_name}, " +
+            "focusing on how and why it works harmonically."
+        )
+
+        return MusicResponse(
+            text=explanation,
+            audio=encode_audio(substitution),
+            visualization=create_substitution_visualization(sub_request),
+            next_steps=[
+                "Would you like to hear other substitutions?",
+                "I can apply this to other parts of the tune",
+                "We can explore more advanced substitutions"
+            ]
+        )
+    else:
+        return MusicResponse(
+            text="Which tune would you like to explore substitutions for?",
+            next_steps=["Name any tune", "Or I can suggest some good tunes for substitutions"]
+        )
+
+async def handle_general_music_request(text: str) -> MusicResponse:
+    """Handle general music conversation"""
+    response = await ask_gpt_or_generate_meme(
+        f"Respond to this music-related question: '{text}'. " +
+        "If relevant, suggest specific tunes or concepts we could explore musically."
+    )
+
+    return MusicResponse(
+        text=response,
+        next_steps=[
+            "Would you like to hear any musical examples?",
+            "We can explore specific tunes or concepts",
+            "I can demonstrate anything we discussed"
+        ]
+    )
+
+def parse_musical_intent(response: str) -> Tuple[str, Dict[str, Any]]:
+    """Parse the musical intent and entities from GPT response"""
+    # Implementation of intent parsing
+    pass
+
+def encode_audio(audio_data) -> str:
+    """Convert audio data to base64 string"""
+    # Implementation of audio encoding
+    pass
+
+def create_chord_visualization(progression: ChordProgression) -> Dict[str, Any]:
+    """Create visualization data for chord progression"""
+    # Implementation of chord visualization
+    pass
+
+def create_concept_visualization(concept: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Create visualization data for musical concept"""
+    # Implementation of concept visualization
+    pass
+
+def create_substitution_visualization(sub_request: SubstitutionRequest) -> Dict[str, Any]:
+    """Create visualization data for chord substitution"""
+    # Implementation of substitution visualization
+    pass
+
+async def generate_practice_examples(progression: ChordProgression, concept: str = None):
+    """Generate musical examples for practice exercises"""
+    # Implementation of practice example generation
+    pass
+
+@app.post("/analyze-music")
+async def analyze_music(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_file.write(contents)
+            temp_path = temp_file.name
+
+        # Load audio
+        y, sr = librosa.load(temp_path, sr=None)
+
+        # Advanced Analysis
+        analysis = {
+            "transcription": transcribe_audio(y, sr),
+            "harmony": analyze_harmony(y, sr),
+            "rhythm": analyze_rhythm(y, sr),
+            "style": analyze_style(y, sr),
+            "suggestions": generate_suggestions(y, sr)
+        }
+
+        return analysis
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def transcribe_audio(y, sr):
+    """Advanced transcription using Onsets and Frames"""
+    # Convert audio to MIDI using Magenta's transcription
+    sequence = audio_io.wav_to_sequence(y, sr)
+
+    # Extract detailed note information
+    notes_info = []
+    for note in sequence.notes:
+        notes_info.append({
+            "pitch": note.pitch,
+            "start_time": note.start_time,
+            "end_time": note.end_time,
+            "velocity": note.velocity,
+            "instrument": note.instrument,
+            "program": note.program
+        })
+
+    return {
+        "notes": notes_info,
+        "tempo": sequence.tempos[0].qpm if sequence.tempos else 120,
+        "time_signatures": [(ts.numerator, ts.denominator) for ts in sequence.time_signatures]
+    }
+
+def analyze_harmony(y, sr):
+    """Advanced harmonic analysis"""
+    # Chromagram for harmony analysis
+    chromagram = librosa.feature.chroma_cqt(y=y, sr=sr)
+
+    # Use Magenta's MusicVAE for advanced harmony understanding
+    sequence = audio_io.wav_to_sequence(y, sr)
+    z = vae_model.encode([sequence])
+
+    # Extract harmonic features
+    harmony_analysis = {
+        "chord_progression": extract_chords(chromagram),
+        "key_signature": detect_key(chromagram),
+        "modulations": detect_modulations(chromagram),
+        "tension_resolution": analyze_tension(z),
+        "voice_leading": analyze_voice_leading(sequence)
+    }
+
+    return harmony_analysis
+
+def analyze_rhythm(y, sr):
+    """Advanced rhythm analysis"""
+    # Onset detection
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+
+    # Groove analysis using Magenta
+    sequence = audio_io.wav_to_sequence(y, sr)
+    groove_features = analyze_groove(sequence)
+
+    return {
+        "tempo": tempo,
+        "beat_positions": beats.tolist(),
+        "groove_type": groove_features["type"],
+        "swing_ratio": groove_features["swing"],
+        "syncopation": groove_features["syncopation"],
+        "complexity": groove_features["complexity"]
+    }
+
+def analyze_style(y, sr):
+    """Style analysis using MusicVAE"""
+    sequence = audio_io.wav_to_sequence(y, sr)
+    z = vae_model.encode([sequence])
+
+    # Analyze style characteristics
+    style_features = {
+        "genre_prediction": predict_genre(z),
+        "era_estimation": estimate_era(z),
+        "influences": detect_influences(z),
+        "playing_technique": analyze_technique(sequence),
+        "expressiveness": measure_expressiveness(sequence)
+    }
+
+    return style_features
+
+def generate_suggestions(y, sr):
+    """Generate practice and improvisation suggestions"""
+    sequence = audio_io.wav_to_sequence(y, sr)
+
+    # Generate various suggestions
+    suggestions = {
+        "practice_exercises": generate_exercises(sequence),
+        "improvisation_ideas": generate_improv_ideas(sequence),
+        "reharmonization": suggest_reharmonization(sequence),
+        "rhythmic_variations": generate_rhythm_variations(sequence),
+        "scale_suggestions": suggest_scales(sequence)
+    }
+
+    return suggestions
+
+@app.post("/generate-backing")
+async def generate_backing_track(params: GenerationParams, background_tasks: BackgroundTasks):
+    """Generate a backing track with specified parameters"""
+    temp_midi = None
+    temp_wav = None
+    try:
+        print(f"\nReceived backing track request with params: {params}")
+
+        # Step 1: Interpret the prompt
+        print("Interpreting prompt...")
+        progression, style = await interpret_prompt(params.prompt)
+        print(f"Interpreted progression: {progression}, style: {style}")
+
+        # Step 2: Create sequence
+        print("Creating chord sequence...")
+        sequence = create_chord_sequence(progression, tempo=params.tempo, style=style)
+        print("Chord sequence created")
+
+        # Step 3: Add comping rhythm
+        print("Adding comping rhythm...")
+        try:
+            sequence = add_comping_rhythm(sequence, style)
+            print("Comping rhythm added")
+        except Exception as e:
+            print(f"Warning: Error adding comping rhythm: {str(e)}")
+            # Continue with basic sequence
+
+        # Step 4: Add accompaniment
+        print("Adding accompaniment...")
+        try:
+            sequence = add_accompaniment(sequence, {"style": style, "drums": True})
+            print("Accompaniment added")
+        except Exception as e:
+            print(f"Warning: Error adding accompaniment: {str(e)}")
+            # Continue with what we have
+
+        # Step 5: Generate audio
+        print("Generating audio...")
+        temp_midi = tempfile.NamedTemporaryFile(suffix='.mid', delete=False)
+        print(f"Created temp MIDI file: {temp_midi.name}")
+        sequence.write(temp_midi.name)
+        temp_midi.close()
+
+        print("Converting to note sequence...")
+        ns = note_seq.midi_file_to_note_sequence(temp_midi.name)
+
+        print("Synthesizing audio...")
+        audio = note_seq.synthesize(ns, sample_rate=44100)
+
+        # Save as WAV file with compression
+        temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        print(f"Saving to WAV file: {temp_wav.name}")
+        # Use lower quality settings for smaller file size
+        sf.write(temp_wav.name, audio, 44100, format='WAV', subtype='PCM_16')
+        temp_wav.close()
+        print(f"Successfully generated audio file: {temp_wav.name}")
+
+        # Verify the file exists and is readable
+        if not os.path.exists(temp_wav.name):
+            raise FileNotFoundError("Generated WAV file not found")
+
+        if not os.access(temp_wav.name, os.R_OK):
+            raise PermissionError("Cannot read generated WAV file")
+
+        # Clean up MIDI file immediately
+        if temp_midi and os.path.exists(temp_midi.name):
+            os.unlink(temp_midi.name)
+
+        # Schedule WAV file cleanup as a background task
+        def cleanup_wav(wav_path: str):
+            try:
+                if os.path.exists(wav_path):
+                    os.unlink(wav_path)
+            except Exception as e:
+                print(f"Error cleaning up WAV file: {e}")
+
+        background_tasks.add_task(cleanup_wav, temp_wav.name)
+
+        # Create a generator to stream the file in chunks
+        def iterfile():
+            with open(temp_wav.name, 'rb') as f:
+                chunk = f.read(8192)  # 8KB chunks
+                while chunk:
+                    yield chunk
+                    chunk = f.read(8192)
+
+        # Return a streaming response
+        return StreamingResponse(
+            iterfile(),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=backing_track.wav",
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+                "Transfer-Encoding": "chunked"
+            }
+        )
+
+    except Exception as e:
+        # Clean up temporary files in case of error
+        try:
+            if temp_midi and os.path.exists(temp_midi.name):
+                os.unlink(temp_midi.name)
+            if temp_wav and os.path.exists(temp_wav.name):
+                os.unlink(temp_wav.name)
+        except Exception as cleanup_error:
+            print(f"Error during cleanup: {cleanup_error}")
+
+        print(f"Error in generate_backing_track: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate backing track: {str(e)}"
+        )
+
+def create_initial_sequence(progression: List[Union[str, Tuple[str, float]]], tempo: int = 120) -> pretty_midi.PrettyMIDI:
+    """Create initial MIDI sequence from chord progression"""
+    # Create a PrettyMIDI object
+    pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)  # Set initial tempo explicitly
+
+    # Create a piano program
+    piano = pretty_midi.Instrument(
+        program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano'),
+        name='Piano'
+    )
+
+    # Calculate timing
+    seconds_per_beat = 60.0 / tempo
+    current_time = 0.0
+
+    # Handle both string-only and (chord, duration) tuple formats
+    for item in progression:
+        if isinstance(item, tuple):
+            chord_name, beats = item
+        else:
+            chord_name, beats = item, 4.0  # Default to 4 beats if not specified
+
+        # Calculate start and end times
+        start_time = current_time
+        end_time = start_time + (beats * seconds_per_beat - 0.1)  # Slight gap between chords
+        current_time = start_time + (beats * seconds_per_beat)
+
+        # Get the chord notes
+        root, quality = parse_chord_symbol(chord_name)
+        root_num = pretty_midi.note_name_to_number(root + "4")
+        intervals = get_chord_intervals(quality)
+
+        # Create the chord notes
+        for interval in intervals:
+            note = pretty_midi.Note(
+                velocity=80,
+                pitch=root_num + interval,
+                start=start_time,
+                end=end_time
+            )
+            piano.notes.append(note)
+
+    # Add the piano instrument to the PrettyMIDI object
+    pm.instruments.append(piano)
+    return pm
+
+def create_chord_sequence(chords: List[Union[str, Tuple[str, float]]], tempo: int = 120, style: str = "swing") -> pretty_midi.PrettyMIDI:
+    """Create a MIDI sequence from a list of chords"""
+    pm = pretty_midi.PrettyMIDI()
+
+    # Set tempo directly using initial_tempo
+    pm.initial_tempo = tempo
+
+    # Create piano program
+    piano = pretty_midi.Instrument(program=0)
+
+    # Add chords with timing based on style
+    current_time = 0.0
+    for chord_item in chords:
+        # Handle both string and tuple formats
+        if isinstance(chord_item, tuple):
+            chord, duration = chord_item
+        else:
+            chord = chord_item
+            duration = 2.0  # Default duration if not specified
+
+        # Convert chord to MIDI notes
+        notes = chord_to_midi_notes(chord)
+
+        # Calculate note duration in seconds
+        seconds_per_beat = 60.0 / tempo
+        note_duration = duration * seconds_per_beat
+
+        # Add each note to the piano track
+        for note_num in notes:
+            note = pretty_midi.Note(
+                velocity=100,
+                pitch=note_num,
+                start=current_time,
+                end=current_time + (note_duration * 0.95)  # Slightly shorter for articulation
+            )
+            piano.notes.append(note)
+
+        current_time += note_duration
+
+    pm.instruments.append(piano)
+    return pm
+
+def generate_backing_track(prompt: str, tempo: int = 120, style: str = "swing") -> pretty_midi.PrettyMIDI:
+    """Generate a backing track from a prompt"""
+    pm = pretty_midi.PrettyMIDI()
+
+    # Set tempo directly using initial_tempo
+    pm.initial_tempo = tempo
+
+    # Create piano program for chords
+    piano = pretty_midi.Instrument(program=0)
+
+    # Add some basic chords
+    chords = ["Cmaj7", "Am7", "Dm7", "G7"]
+
+    # Use create_chord_sequence with style parameter
+    return create_chord_sequence(chords, tempo=tempo, style=style)
+
+def parse_chord_symbol(chord: str) -> Tuple[str, str]:
+    """Parse a chord symbol into root note and quality"""
+    # Regular expression to match chord symbols
+    match = re.match(r'([A-G][#b]?)(.*)$', chord)
+    if not match:
+        return 'C', 'maj'  # Default to C major if no match
+
+    root, quality = match.groups()
+    quality = quality.strip()
+
+    # Keep the full quality string to preserve GPT's intended extensions
+    if not quality:
+        quality = 'maj'  # Default to major if no quality specified
+
+    return root, quality
+
+def get_chord_intervals(quality: str) -> List[int]:
+    """Get intervals for chord quality"""
+    # Define common chord intervals
+    intervals = {
+        "maj": [0, 4, 7],           # Major triad
+        "maj7": [0, 4, 7, 11],      # Major seventh
+        "7": [0, 4, 7, 10],         # Dominant seventh
+        "min": [0, 3, 7],           # Minor triad (primary form)
+        "min7": [0, 3, 7, 10],      # Minor seventh (primary form)
+        "min9": [0, 3, 7, 10, 14],  # Minor ninth
+        "min11": [0, 3, 7, 10, 14, 17],  # Minor eleventh
+        "min13": [0, 3, 7, 10, 14, 17, 21],  # Minor thirteenth
+        "dim": [0, 3, 6],           # Diminished triad
+        "dim7": [0, 3, 6, 9],       # Diminished seventh
+        "min7b5": [0, 3, 6, 10],    # Half-diminished
+        "aug": [0, 4, 8],           # Augmented
+        "sus4": [0, 5, 7],          # Suspended fourth
+        "sus2": [0, 2, 7],          # Suspended second
+        "6": [0, 4, 7, 9],          # Major sixth
+        "min6": [0, 3, 7, 9],       # Minor sixth
+        "9": [0, 4, 7, 10, 14],     # Dominant ninth
+        "maj9": [0, 4, 7, 11, 14],  # Major ninth
+        "m9": [0, 3, 7, 10, 14]   # Minor ninth
+    }
+
+    # Handle common variations
+    quality_map = {
+        "": "maj",
+        "M": "maj",
+        "M7": "maj7",
+        "-": "min",      # Map to min instead of m
+        "-7": "min7",    # Map to min7 instead of m7
+        "ø": "min7b5",
+        "o": "dim",
+        "+": "aug",
+        "m": "min",      # Legacy support
+        "m7": "min7",    # Legacy support
+        "m9": "min9",    # Legacy support
+    }
+
+    # Clean up quality string and map to standard form
+    quality = quality.strip()
+    standard_quality = quality_map.get(quality, quality)
+
+    # Return intervals for the quality, defaulting to major triad if not found
+    return intervals.get(standard_quality, intervals["maj"])
+
+def add_comping_rhythm(sequence: pretty_midi.PrettyMIDI, style: str) -> pretty_midi.PrettyMIDI:
+    """Add appropriate comping rhythm to the sequence"""
+    try:
+        # Create a new piano track for comping
+        comping_piano = pretty_midi.Instrument(
+            program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano')
+        )
+
+        # Get timing info from the sequence's initial tempo
+        tempo = getattr(sequence, 'initial_tempo', 120)  # Default to 120 if not set
+        seconds_per_beat = 60.0 / tempo
+        measure_duration = seconds_per_beat * 4  # Assuming 4/4 time
+
+        if sequence.instruments and sequence.instruments[0].notes:
+            end_time = max(note.end for note in sequence.instruments[0].notes)
+            num_measures = max(2, int(end_time / measure_duration) + 1)
+        else:
+            return sequence
+
+        # Add comping pattern based on style
+        if style == "swing":
+            # Swing comping pattern (2 and 4)
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chords on beats 2 and 4
+                for beat in [1, 3]:  # 0-based, so 1 and 3 are beats 2 and 4
+                    beat_time = measure_start + (beat * seconds_per_beat)
+                    # Get the chord at this time
+                    chord_notes = get_chord_notes_at_time(sequence, beat_time)
+                    if chord_notes:
+                        # Add each note in the chord
+                        for note_num in chord_notes:
+                            note = pretty_midi.Note(
+                                velocity=70,  # Slightly softer than melody
+                                pitch=note_num,
+                                start=beat_time,
+                                end=beat_time + (seconds_per_beat * 0.8)  # Slightly shorter for articulation
+                            )
+                            comping_piano.notes.append(note)
+
+        elif style == "latin":
+            # Latin comping pattern (syncopated)
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chords on the "and" of beats 2 and 4
+                for beat in [1.5, 3.5]:
+                    beat_time = measure_start + (beat * seconds_per_beat)
+                    chord_notes = get_chord_notes_at_time(sequence, beat_time)
+                    if chord_notes:
+                        for note_num in chord_notes:
+                            note = pretty_midi.Note(
+                                velocity=75,
+                                pitch=note_num,
+                                start=beat_time,
+                                end=beat_time + (seconds_per_beat * 0.5)
+                            )
+                            comping_piano.notes.append(note)
+
+        else:  # Default to basic pattern
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chord on beat 1
+                chord_notes = get_chord_notes_at_time(sequence, measure_start)
+                if chord_notes:
+                    for note_num in chord_notes:
+                        note = pretty_midi.Note(
+                            velocity=80,
+                            pitch=note_num,
+                            start=measure_start,
+                            end=measure_start + (measure_duration * 0.9)
+                        )
+                        comping_piano.notes.append(note)
+
+        sequence.instruments.append(comping_piano)
+        return sequence
+
+    except Exception as e:
+        print(f"Error in add_comping_rhythm: {str(e)}")
+        return sequence
+
+def get_jazz_voicing(chord_name: str, voicing_notes: Dict = None) -> List[int]:
+    """Get appropriate jazz voicing for a chord"""
+    root, quality = parse_chord_symbol(chord_name)
+    root_num = pretty_midi.note_name_to_number(root + "4")
+
+    # Default jazz voicings
+    voicings = {
+        "maj7": [0, 4, 7, 11],
+        "7": [0, 4, 7, 10],
+        "m7": [0, 3, 7, 10],
+        "m7b5": [0, 3, 6, 10],
+        "dim7": [0, 3, 6, 9],
+        "maj9": [0, 4, 7, 11, 14],
+        "9": [0, 4, 7, 10, 14],
+        "m9": [0, 3, 7, 10, 14]
+    }
+
+    intervals = voicings.get(quality, voicings["maj7"])
+    return [root_num + interval for interval in intervals]
+
+@app.post("/internal/completion")
+async def internal_completion(message: Message):
+    """Internal endpoint for GPT completions, called by brain.py"""
+    try:
+        # Simply pass through to brain.py's ask_gpt_or_generate_meme
+        response = await ask_gpt_or_generate_meme(message.text)
+        return {"choices": [{"message": {"content": response}}]}
+    except Exception as e:
+        print(f"Internal completion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/completion")
+async def get_completion(message: Message):
+    """External endpoint that routes through brain.py for conversation management"""
+    try:
+        # Process through brain to maintain conversation context
+        response = await ask_gpt_or_generate_meme(message.text, source="web")
+
+        if not response:
+            raise HTTPException(status_code=500, detail="No response received from GPT")
+
+        return {"response": response}
+
+    except Exception as e:
+        print(f"Completion error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "message": "Failed to get completion response",
+                "type": "completion_error"
+            }
+        )
+
+@app.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    generate_sheet_music: bool = True
+):
+    """Transcribe uploaded audio and provide sheet music"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        # Load and process audio
+        y, sr = librosa.load(temp_path)
+
+        # Extract musical features
+        notes = extract_notes(y, sr)
+        chords = extract_chords(y, sr)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        key = estimate_key(y, sr)
+
+        # Create music21 score from transcription
+        score = create_score_from_transcription(notes, chords, tempo, key)
+
+        # Generate sheet music if requested
+        sheet_music = None
+        if generate_sheet_music:
+            sheet_music = score.write('musicxml')
+
+        return {
+            "transcription": {
+                "notes": notes,
+                "chords": chords,
+                "tempo": tempo,
+                "key": key
+            },
+            "sheet_music": base64.b64encode(sheet_music).decode() if sheet_music else None,
+            "visualization": create_transcription_visualization(notes, chords, beats)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def extract_advanced_features(y, sr):
+    """Extract advanced musical features using librosa"""
+
+    # Harmonic-percussive source separation
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+    # Chord detection using harmonic CQT
+    chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr)
+    chord_features = np.mean(chroma, axis=1)
+
+    # Rhythm features
+    tempo, beats = librosa.beat.beat_track(y=y_percussive, sr=sr)
+    beat_times = librosa.frames_to_time(beats, sr=sr)
+
+    # Tonal features
+    tonnetz = librosa.feature.tonnetz(y=y_harmonic, sr=sr)
+    tonal_features = np.mean(tonnetz, axis=1)
+
+    # Mel-frequency features
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    mfcc_delta = librosa.feature.delta(mfcc)
+
+    # Spectral features
+    spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+
+    return {
+        'chroma': chord_features,
+        'tonal': tonal_features,
+        'mfcc': np.mean(mfcc, axis=1),
+        'mfcc_delta': np.mean(mfcc_delta, axis=1),
+        'spectral_contrast': np.mean(spectral_contrast, axis=1),
+        'beat_times': beat_times,
+        'tempo': tempo
+    }
+
+def get_song_fingerprint(y, sr):
+    """Generate a simple audio fingerprint using spectral peaks"""
+
+    # Get mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
+
+    # Find peaks in each mel band
+    peaks = []
+    for i in range(mel_spec.shape[0]):
+        peak_indices = librosa.util.peak_pick(mel_spec[i],
+                                            pre_max=3,
+                                            post_max=3,
+                                            pre_avg=3,
+                                            post_avg=5,
+                                            delta=0.1,
+                                            wait=10)
+        peaks.extend([(i, p) for p in peak_indices])
+
+    # Sort peaks by amplitude
+    peak_amplitudes = [(p[0], p[1], mel_spec[p[0], p[1]]) for p in peaks]
+    peak_amplitudes.sort(key=lambda x: x[2], reverse=True)
+
+    # Take top peaks as fingerprint
+    fingerprint = peak_amplitudes[:50] if len(peak_amplitudes) > 50 else peak_amplitudes
+    return fingerprint
+
+def analyze_structure(y, sr):
+    """Analyze the musical structure using novelty detection and rhythm"""
+
+    # Compute mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
+
+    # Compute novelty curve from mel spectrogram
+    mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+    novelty = np.diff(mel_db, axis=1)
+    novelty = np.mean(novelty, axis=0)
+    novelty = np.maximum(0, novelty)
+
+    # Compute tempogram for rhythmic structure
+    tempo_env = librosa.onset.onset_strength(y=y, sr=sr)
+    tempogram = librosa.feature.tempogram(onset_envelope=tempo_env, sr=sr)
+
+    # Find peaks in novelty curve for segment boundaries
+    bounds = librosa.util.peak_pick(novelty,
+                                  pre_max=3,
+                                  post_max=3,
+                                  pre_avg=3,
+                                  post_avg=5,
+                                  delta=0.1,
+                                  wait=10)
+
+    # Convert frame indices to time
+    segments = librosa.frames_to_time(bounds, sr=sr)
+
+    # Add first and last points if not present
+    if len(segments) == 0 or segments[0] > 0:
+        segments = np.concatenate([[0], segments])
+    if len(segments) == 0 or segments[-1] < librosa.get_duration(y=y, sr=sr):
+        segments = np.concatenate([segments, [librosa.get_duration(y=y, sr=sr)]])
+
+    return segments
+
+def analyze_jazz_harmony(audio_data: np.ndarray, sr: int) -> JazzAnalysis:
+    # Extract chroma and beats
+    chroma = librosa.feature.chroma_cqt(y=audio_data, sr=sr)
+    tempo, beats = librosa.beat.beat_track(y=audio_data, sr=sr)
+
+    # Detect key and mode
+    key = librosa.feature.tonnetz(y=audio_data, sr=sr)
+
+    # Advanced chord detection with extensions
+    chords = []
+    for beat_time in beats:
+        segment = audio_data[int(beat_time*sr):int((beat_time+1)*sr)]
+        if len(segment) > 0:
+            chord_notes = librosa.feature.chroma_cqt(y=segment, sr=sr)
+            root = notes.int_to_note(np.argmax(np.mean(chord_notes, axis=1)))
+            # Use mingus for advanced chord analysis
+            chord_type = chords.determine(NoteContainer(root), shorthand=True)
+            chords.append(chord_type[0] if chord_type else "N.C.")
+
+    # Analyze voice leading and modulations
+    voice_leading = []
+    modulations = []
+    for i in range(len(chords)-1):
+        if chords[i] != chords[i+1]:
+            voice_leading.append({
+                "from": chords[i],
+                "to": chords[i+1],
+                "movement": analyze_voice_movement(chords[i], chords[i+1])
+            })
+
+    # Detect secondary dominants and substitutions
+    secondary_doms = []
+    substitutions = []
+    for i, chord in enumerate(chords[:-1]):
+        if is_secondary_dominant(chord, chords[i+1]):
+            secondary_doms.append(chord)
+        if is_substitution(chord, chords[i+1]):
+            substitutions.append({
+                "original": chord,
+                "substitution": chords[i+1],
+                "type": determine_substitution_type(chord, chords[i+1])
+            })
+
+    return JazzAnalysis(
+        chord_progression=chords,
+        key=determine_key(key),
+        mode=determine_mode(key),
+        secondary_dominants=secondary_doms,
+        modulations=modulations,
+        voice_leading=voice_leading,
+        form=analyze_form(chords),
+        extensions=detect_extensions(chords),
+        substitutions=substitutions,
+        reharmonization=suggest_reharmonization(chords),
+        modal_interchange=detect_modal_interchange(chords),
+        rhythmic_feel=analyze_rhythm(beats),
+        swing_ratio=calculate_swing_ratio(beats))
+
+def analyze_voice_movement(chord1: str, chord2: str) -> dict:
+    # Analyze voice leading between chords
+    c1 = NoteContainer(chord1)
+    c2 = NoteContainer(chord2)
+    movements = []
+    for n1, n2 in zip(sorted(c1), sorted(c2)):
+        interval = notes.measure_interval(n1, n2)
+        movements.append({"from": n1, "to": n2, "interval": interval})
+    return movements
+
+def is_secondary_dominant(chord: str, next_chord: str) -> bool:
+    # Check if chord is a secondary dominant
+    if "7" not in chord:
+        return False
+    root = chord.split("7")[0]
+    target = next_chord.split(":")[0] if ":" in next_chord else next_chord
+    return notes.measure_interval(root, target) == 5
+
+def determine_substitution_type(chord1: str, chord2: str) -> str:
+    # Analyze type of substitution (tritone, relative, etc.)
+    if notes.measure_interval(chord1.split(":")[0], chord2.split(":")[0]) == 6:
+        return "tritone"
+    return "relative" if are_relative(chord1, chord2) else "other"
+
+@app.get("/download/{file_type}/{filename}")
+async def download_file(file_type: str, filename: str):
+    """Download generated files (MIDI or PDF sheet music)"""
+    if file_type not in ['midi', 'sheet_music']:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    # Handle file extensions
+    if file_type == 'sheet_music':
+        # Try different possible file paths
+        possible_paths = [
+            os.path.join(tempfile.gettempdir(), filename + '.ly.pdf'),
+            os.path.join(tempfile.gettempdir(), filename + '.pdf'),
+            os.path.join(tempfile.gettempdir(), filename + '.ly')
+        ]
+        file_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                file_path = path
+                break
+    else:
+        file_path = os.path.join(tempfile.gettempdir(), filename)
+
+    if not file_path or not os.path.exists(file_path):
+        print(f"File not found. Tried paths for {filename}")
+        print(f"Contents of /tmp: {os.listdir(tempfile.gettempdir())}")
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Set the correct filename for download
+    download_filename = filename
+    if file_type == 'sheet_music':
+        download_filename = filename + '.pdf'
+
+    media_type = 'audio/midi' if file_type == 'midi' else 'application/pdf'
+    return FileResponse(file_path, media_type=media_type, filename=download_filename)
+
+@app.post("/analyze_jazz")
+async def analyze_jazz(file: UploadFile = File(...)):
+    try:
+        # Read audio file
+        contents = await file.read()
+        audio_data, sr = sf.read(io.BytesIO(contents))
+
+        # Perform analysis
+        analysis = analyze_jazz_harmony(audio_data, sr)
+
+        return analysis
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/play-chord-progression")
+async def play_chord_progression(progression: ChordProgression):
+    """Generate and play a chord progression with proper voicings"""
+    try:
+        # Create a MIDI sequence from the chord progression
+        sequence = create_chord_sequence(
+            progression.chords,
+            tempo=progression.tempo,
+            style=progression.style
+        )
+
+        # Add appropriate comping rhythm based on style
+        sequence = add_comping_rhythm(sequence, progression.style)
+
+        # Synthesize audio
+        audio_data = midi_synth.synthesize(sequence, sample_rate=44100)
+
+        # Return audio file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_data, 44100)
+            return FileResponse(
+                temp_file.name,
+                media_type="audio/wav",
+                filename="chord_progression.wav"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/demonstrate-substitution")
+async def demonstrate_substitution(request: SubstitutionRequest):
+    """Demonstrate a chord substitution with musical context"""
+    try:
+        # Generate original and substituted sequences
+        original = create_chord_sequence([request.chord], tempo=120)
+        substituted = apply_substitution(
+            request.chord,
+            request.substitution_type,
+            request.context
+        )
+
+        # Combine sequences with a transition
+        sequence = merge_sequences([original, substituted])
+
+        # Synthesize audio
+        audio_data = midi_synth.synthesize(sequence, sample_rate=44100)
+
+        # Return audio file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_data, 44100)
+            return FileResponse(
+                temp_file.name,
+                media_type="audio/wav",
+                filename="substitution_demo.wav"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate-musical-example")
+async def generate_musical_example(example: MusicalExample):
+    """Generate a musical example demonstrating a theoretical concept"""
+    try:
+        # Generate appropriate musical sequence based on concept
+        sequence = generate_concept_example(
+            example.concept,
+            example.context,
+            example.length
+        )
+
+        # Add appropriate accompaniment
+        sequence = add_accompaniment(sequence, example.context)
+
+        # Synthesize audio
+        audio_data = midi_synth.synthesize(sequence, sample_rate=44100)
+
+        # Return audio file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_data, 44100)
+            return FileResponse(
+                temp_file.name,
+                media_type="audio/wav",
+                filename="musical_example.wav"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/improvise-response")
+async def improvise_response(progression: ChordProgression):
+    """Generate an improvised response over the given chord progression"""
+    try:
+        # Create backing sequence from chord progression
+        backing = create_chord_sequence(
+            progression.chords,
+            tempo=progression.tempo,
+            style=progression.style
+        )
+
+        # Generate improvised melody using Improv RNN
+        melody = improv_model.generate(
+            backing,
+            temperature=0.8
+        )
+
+        # Combine backing and melody
+        sequence = merge_sequences([backing, melody])
+
+        # Synthesize audio
+        audio_data = midi_synth.synthesize(sequence, sample_rate=44100)
+
+        # Return audio file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_data, 44100)
+            return FileResponse(
+                temp_file.name,
+                media_type="audio/wav",
+                filename="improvised_response.wav"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def get_chord_voicing(chord_symbol: str, style: str = "swing", complexity: float = 0.5) -> List[int]:
+    """Get appropriate jazz voicing for a chord symbol"""
+    root, quality = parse_chord_symbol(chord_symbol)
+    root_num = pretty_midi.note_name_to_number(root + "4")
+
+    # Base intervals for different qualities
+    intervals = []
+
+    # Set up base triad
+    if any(x in quality for x in ['m', 'min', '-']):
+        intervals = [0, 3, 7]  # Minor triad
+    elif 'dim' in quality:
+        intervals = [0, 3, 6]  # Diminished triad
+    elif 'aug' in quality:
+        intervals = [0, 4, 8]  # Augmented triad
+    elif 'sus4' in quality:
+        intervals = [0, 5, 7]  # Suspended fourth
+    else:
+        intervals = [0, 4, 7]  # Major triad
+
+    # Add sevenths (always include seventh with extensions)
+    if 'maj7' in quality or 'M7' in quality:
+        intervals.append(11)  # Major seventh
+    elif any(x in quality for x in ['7', '9', '11', '13']):
+        intervals.append(10)  # Dominant seventh
+    elif '6' in quality:
+        intervals.append(9)   # Sixth
+
+    # Add extensions (ensuring proper inclusion of lower extensions)
+    if '13' in quality:
+        intervals.extend([14, 17, 21])  # Add 9, 11, 13
+    elif '11' in quality:
+        intervals.extend([14, 17])      # Add 9, 11
+    elif '9' in quality:
+        intervals.append(14)            # Add 9
+
+    # Handle alterations
+    if 'b5' in quality:
+        intervals = [i if i != 7 else 6 for i in intervals]
+    if '#5' in quality:
+        intervals = [i if i != 7 else 8 for i in intervals]
+    if 'b9' in quality:
+        intervals = [i if i != 14 else 13 for i in intervals]
+    if '#9' in quality:
+        intervals = [i if i != 14 else 15 for i in intervals]
+    if '#11' in quality:
+        intervals.append(18)
+    if 'b13' in quality:
+        intervals.append(20)
+
+    # Handle alt chord
+    if 'alt' in quality:
+        intervals = [0, 4, 8, 10, 13, 15]  # 7#5b9#9
+
+    # Convert intervals to MIDI notes
+    notes = [root_num + interval for interval in intervals]
+
+    # Apply voicing spacing
+    return space_voicing(notes, complexity)
+
+def space_voicing(notes: List[int], complexity: float) -> List[int]:
+    """Apply proper jazz voicing spacing"""
+    if not notes:
+        return []
+
+    # Sort notes
+    notes.sort()
+
+    # Keep root in bass
+    result = [notes[0]]
+
+    # Space remaining notes based on complexity
+    remaining = notes[1:]
+    current_octave = 0
+
+    for note in remaining:
+        # More complex voicings will have wider spacing
+        min_spacing = 2 if complexity < 0.5 else 3
+        while note + (current_octave * 12) - result[-1] < min_spacing:
+            current_octave += 1
+        result.append(note + (current_octave * 12))
+
+    return result
+
+def apply_swing_feel(instrument, swing_amount=0.25):
+    """Apply swing feel to an instrument track"""
+    # Adjust timing of off-beat notes
+    for note in instrument.notes:
+        # Check if note is on an off-beat (8th note)
+        position_in_beat = (note.start % 1.0) * 2
+        if 0.9 < position_in_beat < 1.1:  # Is it an off-beat?
+            # Delay the note by swing_amount
+            note.start += swing_amount
+            note.end += swing_amount
+
+def apply_substitution(chord, sub_type, context):
+    """Apply a chord substitution and return new sequence"""
+    # Parse original chord
+    root, quality = parse_chord_symbol(chord)
+    if not root or not quality:
+        return None
+
+    # Get root note number
+    root_num = pretty_midi.note_name_to_number(root + "4") % 12
+
+    # Define substitution rules
+    substitutions = {
+        "tritone": {
+            "conditions": lambda q: q in ["7"],
+            "transform": lambda r, q: pretty_midi.note_number_to_name((r + 6) % 12 + 60)[:-1] + "7"
+        },
+        "diminished": {
+            "conditions": lambda q: q in ["7", "maj7"],
+            "transform": lambda r, q: pretty_midi.note_number_to_name(r + 60)[:-1] + "dim7"
+        },
+        "minor_third": {
+            "conditions": lambda q: q in ["maj7", "7"],
+            "transform": lambda r, q: pretty_midi.note_number_to_name((r - 3) % 12 + 60)[:-1] + quality
+        },
+        "relative_minor": {
+            "conditions": lambda q: q in ["maj7"],
+            "transform": lambda r, q: pretty_midi.note_number_to_name((r - 3) % 12 + 60)[:-1] + "m7"
+        },
+        "upper_structure": {
+            "conditions": lambda q: q in ["7", "maj7"],
+            "transform": lambda r, q: add_upper_structure(root, quality)
+        }
+    }
+
+    # Check if substitution type exists and conditions are met
+    if sub_type in substitutions:
+        sub_rule = substitutions[sub_type]
+        if sub_rule["conditions"](quality):
+            # Apply the substitution
+            new_chord = sub_rule["transform"](root_num, quality)
+
+            # Create sequences for demonstration
+            original_seq = create_chord_sequence([chord], tempo=120)
+            sub_seq = create_chord_sequence([new_chord], tempo=120)
+
+            # Add transition between original and substitution
+            transition_seq = create_transition(original_seq, sub_seq)
+
+            return merge_sequences([original_seq, transition_seq, sub_seq])
+
+    return None
+
+def create_transition(seq1, seq2):
+    """Create a smooth transition between two chord sequences"""
+    transition = pretty_midi.PrettyMIDI()
+    transition.resolution = 480  # Add this line
+    piano = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano'))
+
+    # Get notes from both sequences at transition point
+    end_notes = get_chord_notes_at_time(seq1, seq1.get_end_time() - 0.1)
+    start_notes = get_chord_notes_at_time(seq2, 0)
+
+    # Create a chromatic approach to new notes
+    transition_time = 0.5  # Half second transition
+    steps = 4  # Number of chromatic steps
+
+    for end_note in end_notes:
+        target_note = min(start_notes, key=lambda x: abs(x - end_note))
+        step_size = (target_note - end_note) / steps
+
+        # Add chromatic approach notes
+        for i in range(steps):
+            note = pretty_midi.Note(
+                velocity=70,
+                pitch=int(end_note + (step_size * i)),
+                start=seq1.get_end_time() + (i * transition_time/steps),
+                end=seq1.get_end_time() + ((i + 1) * transition_time/steps))
+            piano.notes.append(note)
+
+    transition.instruments.append(piano)
+    return transition
+
+def generate_concept_example(concept, context, length):
+    """Generate a musical example demonstrating a concept"""
+    # Define concept examples
+    concepts = {
+        "modal_interchange": generate_modal_interchange_example,
+        "reharmonization": generate_reharmonization_example,
+        "chord_scale": generate_chord_scale_example,
+        "voice_leading": generate_voice_leading_example,
+        "rhythm_changes": generate_rhythm_changes_example,
+        "coltrane_changes": generate_coltrane_changes_example
+    }
+
+    # Check if concept exists
+    if concept in concepts:
+        return concepts[concept](context, length)
+
+    return None
+
+def generate_modal_interchange_example(context, length):
+    """Generate example of modal interchange"""
+    # Basic progression in major
+    progression = ["Cmaj7", "Am7", "Dm7", "G7"]
+
+    # Add modal interchange chords
+    modal_progression = [
+        "Cmaj7",     # I
+        "Abmaj7",    # bVI (borrowed from minor)
+        "Dm7b5",     # ii (borrowed from phrygian)
+        "G7alt"      # V7alt (borrowed from melodic minor)
+    ]
+
+    # Create sequences
+    original = create_chord_sequence(progression * (length // 4))
+    modal = create_chord_sequence(modal_progression * (length // 4))
+
+    # Add appropriate voicings and rhythm
+    original = add_comping_rhythm(original, "swing")
+    modal = add_comping_rhythm(modal, "swing")
+
+    return merge_sequences([original, modal])
+
+def generate_reharmonization_example(context, length):
+    """Generate example of reharmonization"""
+    # Basic progression
+    basic = ["Cmaj7", "Am7", "Dm7", "G7"]
+
+    # Reharmonized version with secondary dominants and tritone subs
+    reharmonized = [
+        "Cmaj7",
+        "E7",        # V7/ii
+        "A7",        # V7/V
+        "Db7"        # tritone sub for G7
+    ]
+
+    # Create sequences
+    original = create_chord_sequence(basic * (length // 4))
+    reharmed = create_chord_sequence(reharmonized * (length // 4))
+
+    # Add appropriate voicings and rhythm
+    original = add_comping_rhythm(original, "swing")
+    reharmed = add_comping_rhythm(reharmed, "swing")
+
+    return merge_sequences([original, reharmed])
+
+def generate_chord_scale_example(context, length):
+    """Generate example of chord-scale relationships"""
+    sequence = pretty_midi.PrettyMIDI(initial_tempo=120)
+    piano = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano'))
+
+    # Define chord and its associated scale
+    chord_scales = {
+        "Cmaj7": generate_scale("C", "ionian"),
+        "C7": generate_scale("C", "mixolydian"),
+        "Cm7": generate_scale("C", "dorian"),
+        "Cm7b5": generate_scale("C", "locrian")
+    }
+
+    current_time = 0.0
+    duration = 0.25  # 16th notes
+
+    # For each chord-scale pair
+    for chord, scale in chord_scales.items():
+        # Add chord
+        chord_seq = create_chord_sequence([chord])
+        for note in chord_seq.instruments[0].notes:
+            piano.notes.append(note)
+            current_time = max(current_time, note.end)
+
+        # Add ascending scale
+        for i, pitch in enumerate(scale):
+            note = pretty_midi.Note(
+                velocity=80,
+                pitch=pitch,
+                start=current_time + (i * duration),
+                end=current_time + ((i + 1) * duration)
+            )
+            piano.notes.append(note)
+
+        # Update time for descending scale
+        current_time += len(scale) * duration
+
+        # Add descending scale
+        for i, pitch in enumerate(reversed(scale)):
+            note = pretty_midi.Note(
+                velocity=80,
+                pitch=pitch,
+                start=current_time + (i * duration),
+                end=current_time + ((i + 1) * duration)
+            )
+            piano.notes.append(note)
+
+        # Update time for next chord-scale pair
+        current_time += len(scale) * duration + 1.0  # Add 1 second gap
+
+    sequence.instruments.append(piano)
+    return sequence
+
+def generate_voice_leading_example(context, length):
+    """Generate example of smooth voice leading"""
+    # Define progression with specific voicings
+    progression = [
+        {"chord": "Cmaj7", "voicing": ["C4", "E4", "G4", "B4"]},
+        {"chord": "A7", "voicing": ["A3", "E4", "G4", "C5"]},
+        {"chord": "Dm7", "voicing": ["D4", "F4", "A4", "C5"]},
+        {"chord": "G7", "voicing": ["G3", "F4", "B4", "D5"]}
+    ]
+
+    sequence = pretty_midi.PrettyMIDI()
+    piano = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano'))
+
+    # Add each chord with specific voicing
+    for i, chord in enumerate(progression):
+        start_time = i * 2.0  # 2 seconds per chord
+
+        # Add each note in the voicing
+        for note_name in chord["voicing"]:
+            note_num = pretty_midi.note_name_to_number(note_name)
+            note = pretty_midi.Note(
+                velocity=80,
+                pitch=note_num,
+                start=start_time,
+                end=start_time + 1.9  # Slight gap between chords
+            )
+            piano.notes.append(note)
+
+    sequence.instruments.append(piano)
+    return sequence
+
+def generate_rhythm_changes_example(context, length):
+    """Generate example of rhythm changes progression"""
+    # Basic rhythm changes progression
+    rhythm_changes = [
+        # A section
+        "Bbmaj7", "G7", "Cm7", "F7",
+        "Bbmaj7", "G7", "Cm7", "F7",
+        "Cm7", "F7", "Bb7", "Eb7",
+        "Cm7", "F7", "Bbmaj7", "F7",
+
+        # B section
+        "D7", "D7", "G7", "G7",
+        "C7", "C7", "F7", "F7"
+    ]
+
+    # Create sequence
+    sequence = create_chord_sequence(rhythm_changes)
+    sequence = add_comping_rhythm(sequence, "swing")
+
+    return sequence
+
+def generate_coltrane_changes_example(context, length):
+    """Generate example of Coltrane changes"""
+    # Giant Steps progression with accurate timing
+    giant_steps = [
+        ("Bmaj7", 2), ("D7", 2),       # Bar 1
+        ("Gmaj7", 2), ("Bb7", 2),      # Bar 2
+        ("Ebmaj7", 4),                 # Bar 3
+        ("Am7", 2), ("D7", 2),         # Bar 4
+        ("Gmaj7", 2), ("Bb7", 2),      # Bar 5
+        ("Ebmaj7", 2), ("F#7", 2),     # Bar 6
+        ("Bmaj7", 2), ("Fm7", 2),      # Bar 7
+        ("Bb7", 1), ("Ebmaj7", 1), ("Am7", 2)  # Bar 8
+    ]
+
+    # Create sequence with proper timing
+    sequence = create_chord_sequence(giant_steps * (length // 8))
+    sequence = add_comping_rhythm(sequence, "swing")
+
+    return sequence
+
+def generate_scale(root, scale_type):
+    """Generate a scale starting from a root note"""
+    # Define scale patterns (intervals from root)
+    scale_patterns = {
+        "ionian":     [0, 2, 4, 5, 7, 9, 11, 12],
+        "dorian":     [0, 2, 3, 5, 7, 9, 10, 12],
+        "phrygian":   [0, 1, 3, 5, 7, 8, 10, 12],
+        "lydian":     [0, 2, 4, 6, 7, 9, 11, 12],
+        "mixolydian": [0, 2, 4, 5, 7, 9, 10, 12],
+        "aeolian":    [0, 2, 3, 5, 7, 8, 10, 12],
+        "locrian":    [0, 1, 3, 5, 6, 8, 10, 12]
+    }
+
+    if scale_type not in scale_patterns:
+        return None
+
+    # Get root note number
+    root_num = pretty_midi.note_name_to_number(root + "4")
+
+    # Generate scale
+    return [root_num + interval for interval in scale_patterns[scale_type]]
+
+def add_accompaniment(sequence, context):
+    """Add appropriate accompaniment to a sequence"""
+    # Get style from context
+    style = context.get("style", "swing")
+
+    # Add walking bass line
+    if style == "swing":
+        sequence = add_walking_bass(sequence)
+    elif style == "latin":
+        sequence = add_latin_bass(sequence)
+    elif style == "ballad":
+        sequence = add_ballad_bass(sequence)
+
+    # Add drums if specified in context
+    if context.get("drums", False):
+        sequence = add_drums(sequence, style)
+
+    return sequence
+
+def add_walking_bass(sequence):
+    """Add walking bass line to sequence"""
+    bass = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Bass'))
+
+    # Get tempo and timing info from the sequence
+    tempo = sequence.estimate_tempo() if sequence.instruments[0].notes else 120
+    seconds_per_beat = 60.0 / tempo
+    measure_duration = seconds_per_beat * 4  # Assuming 4/4 time
+
+    # Get the total duration from the piano track
+    if not sequence.instruments or not sequence.instruments[0].notes:
+        return sequence
+
+    end_time = max(note.end for note in sequence.instruments[0].notes)
+    num_measures = int(end_time / measure_duration) + 1
+
+    # For each measure
+    prev_root = None
+    for measure in range(num_measures):
+        measure_start = measure * measure_duration
+
+        # Get chord at the start of this measure
+        chord_notes = get_chord_notes_at_time(sequence, measure_start)
+        if not chord_notes:
+            continue
+
+        # Get the root note and chord quality
+        root_num = min(chord_notes)
+        chord_type = "maj"  # Default to major
+        if len(chord_notes) >= 3:
+            third = root_num + 4 if (root_num + 4) in chord_notes else root_num + 3
+            if third == root_num + 3:
+                chord_type = "min"
+
+        # Get next measure's chord for targeting
+        next_measure_start = measure_start + measure_duration
+        next_chord_notes = get_chord_notes_at_time(sequence, next_measure_start)
+        next_root = min(next_chord_notes) if next_chord_notes else root_num
+
+        # Create walking pattern (4 beats per measure)
+        for beat in range(4):
+            beat_start = measure_start + (beat * seconds_per_beat)
+
+            # Choose note based on beat position
+            if beat == 0:
+                # Beat 1: Root
+                note_num = root_num - 24  # Two octaves down
+            elif beat == 1:
+                # Beat 2: Scale tone or chromatic approach
+                if random.random() < 0.7:  # 70% chance of scale tone
+                    note_num = root_num - 24 + (2 if chord_type == "maj" else 3)
+                else:
+                    note_num = root_num - 24 + 1
+            elif beat == 2:
+                # Beat3: Fifth or third
+                if random.random() < 0.6:  # 60% chance of fifth
+                    note_num = root_num - 24 + 7
+                else:
+                    note_num = root_num - 24 + (4 if chord_type == "maj" else 3)
+            else:
+                # Beat4: Chromatic approach to next root
+                next_root_bass = next_root - 24
+                if next_root_bass > root_num - 24:
+                    note_num = next_root_bass - 1  # Approach from below
+                else:
+                    note_num = next_root_bass + 1  # Approach from above
+
+            # Create bass note with precise timing
+            note = pretty_midi.Note(
+                velocity=90 if beat == 0 else 80,  # Emphasize beat 1
+                pitch=note_num,
+                start=beat_start,
+                end=beat_start + (seconds_per_beat * 0.95)  # Slightly shorter for articulation
+            )
+            bass.notes.append(note)
+
+        prev_root = root_num
+
+    sequence.instruments.append(bass)
+    return sequence
+
+def add_latin_bass(sequence):
+    """Add Latin-style bass line to sequence"""
+    bass = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Bass'))
+
+    # Define common Latin bass patterns (intervals from root)
+    patterns = {
+        "tumbao": [0, 0, 7, 0, 0, 0, 7, 0],  # Classic tumbao pattern
+        "bossa": [0, 7, 0, 7]  # Simple bossa pattern
+    }
+
+    pattern = patterns["bossa"]  # Default to bossa
+
+    # Group notes by their start time to identify chords
+    chord_times = {}
+    for note in sequence.instruments[0].notes:
+        start_time = note.start
+        if start_time not in chord_times:
+            chord_times[start_time] = []
+        chord_times[start_time].append(note)
+
+    # For each chord time
+    for start_time, chord_notes in sorted(chord_times.items()):
+        # Get the root note (lowest note in the chord)
+        root_num = min(note.pitch for note in chord_notes) - 24  # Two octaves down
+
+        # Duration of each note in pattern
+        end_time = chord_notes[0].end
+        duration = (end_time - start_time) / len(pattern)  # Added missing closing parenthesis
+        for i, interval in enumerate(pattern):
+            note = pretty_midi.Note(
+                velocity=80,
+                pitch=root_num + interval,
+                start=start_time + (i * duration),
+                end=start_time + ((i + 1) * duration)
+            )
+            bass.notes.append(note)
+
+    sequence.instruments.append(bass)
+    return sequence
+
+def add_ballad_bass(sequence):
+    """Add ballad-style bass line to sequence"""
+    bass = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program('Acoustic Bass'))
+
+    for chord in sequence.instruments[0].notes:
+        root, quality = parse_chord_symbol(chord.name)
+        root_num = pretty_midi.note_name_to_number(root + "2")
+
+        # Simple root-fifth pattern
+        note1 = pretty_midi.Note(
+            velocity=75,
+            pitch=chord.root - 12,
+            start=chord.start,
+            end=chord.start + (chord.end - chord.start) / 2
+        )
+
+        note2 = pretty_midi.Note(
+            velocity=75,
+            pitch=chord.root - 12,
+            start=chord.start + (chord.end - chord.start) / 2,
+            end=chord.end
+        )
+
+        bass.notes.append(note1)
+        bass.notes.append(note2)
+
+    sequence.instruments.append(bass)
+    return sequence
+
+def add_drums(sequence: pretty_midi.PrettyMIDI, style: str) -> pretty_midi.PrettyMIDI:
+    """Add drum accompaniment to sequence"""
+    drums = pretty_midi.Instrument(program=0, is_drum=True, name='Drums')
+
+    # Get timing info
+    tempo = sequence.initial_tempo
+    seconds_per_beat = 60.0 / tempo
+    beats_per_measure = 4.0  # Assuming 4/4 time
+    measure_duration = seconds_per_beat * beats_per_measure
+
+    # Define common drum patterns (MIDI note numbers)
+    # 42: Closed Hi-hat, 46: Open Hi-hat, 51: Ride Cymbal
+    # 36: Bass Drum, 38: Snare Drum, 44: Pedal Hi-hat
+    patterns = {
+        "swing": {
+            "ride": [  # Swing ride pattern with accents
+                {"pitch": 51, "velocity": 90},  # 1
+                {"pitch": 51, "velocity": 60},  # 2+
+                {"pitch": 51, "velocity": 75},  # 2
+                {"pitch": 51, "velocity": 60},  # 3+
+                {"pitch": 51, "velocity": 75},  # 3
+                {"pitch": 51, "velocity": 60},  # 4+
+            ],
+            "hihat": [  # Hi-hat chick on 2 and 4
+                {"pitch": 44, "velocity": 0},   # 1
+                {"pitch": 44, "velocity": 0},   # 1+
+                {"pitch": 44, "velocity": 70},  # 2
+                {"pitch": 44, "velocity": 0},   # 2+
+                {"pitch": 44, "velocity": 0},   # 3
+                {"pitch": 44, "velocity": 0},   # 3+
+                {"pitch": 44, "velocity": 70},  # 4
+                {"pitch": 44, "velocity": 0},   # 4+
+            ],
+            "kick": [  # Feathered bass drum
+                {"pitch": 36, "velocity": 100}, # 1
+                {"pitch": 36, "velocity": 0},   # 1+
+                {"pitch": 36, "velocity": 0},   # 2
+                {"pitch": 36, "velocity": 60},  # 2+
+                {"pitch": 36, "velocity": 85},  # 3
+                {"pitch": 36, "velocity": 0},   # 3+
+                {"pitch": 36, "velocity": 0},   # 4
+                {"pitch": 36, "velocity": 70},  # 4+
+            ],
+            "snare": [  # Cross-stick on 2 and 4
+                {"pitch": 38, "velocity": 0},   # 1
+                {"pitch": 38, "velocity": 0},   # 1+
+                {"pitch": 37, "velocity": 70},  # 2 (cross-stick)
+                {"pitch": 38, "velocity": 0},   # 2+
+                {"pitch": 38, "velocity": 0},   # 3
+                {"pitch": 38, "velocity": 0},   # 3+
+                {"pitch": 37, "velocity": 70},  # 4 (cross-stick)
+                {"pitch": 38, "velocity": 0},   # 4+
+            ]
+        }
+    }
+    # Add variations of the basic pattern
+    patterns["swing"]["variations"] = [
+        # Kick drum variations
+        [
+            {"pitch": 36, "velocity": 100}, # 1
+            {"pitch": 36, "velocity": 0},   # 1+
+            {"pitch": 36, "velocity": 70},  # 2
+            {"pitch": 36, "velocity": 0},   # 2+
+            {"pitch": 36, "velocity": 85},  # 3
+            {"pitch": 36, "velocity": 0},   # 3+
+            {"pitch": 36, "velocity": 70},  # 4
+            {"pitch": 36, "velocity": 0},   # 4+
+        ],
+        # Snare fill variation
+        [
+            {"pitch": 38, "velocity": 0},   # 1
+            {"pitch": 38, "velocity": 0},   # 1+
+            {"pitch": 37, "velocity": 70},  # 2
+            {"pitch": 38, "velocity": 0},   # 2+
+            {"pitch": 38, "velocity": 0},   # 3
+            {"pitch": 38, "velocity": 60},  # 3+
+            {"pitch": 37, "velocity": 70},  # 4
+            {"pitch": 38, "velocity": 60},  # 4+
+        ]
+    ]
+
+    pattern = patterns.get(style, patterns["swing"])
+
+    # Get total duration from the sequence
+    if not sequence.instruments or not sequence.instruments[0].notes:
+        return sequence
+
+    end_time = max(note.end for note in sequence.instruments[0].notes)
+    num_measures = int(end_time / measure_duration) + 1
+
+    # Add drum pattern for each measure
+    for measure in range(num_measures):
+        measure_start = measure * measure_duration
+        beat_duration = measure_duration / (len(pattern["ride"]) / 2)  # Divide by 2 for swing feel
+
+        # Decide if we should use a variation
+        use_variation = random.random() < 0.2  # 20% chance of variation
+
+        # Add each drum component
+        for i in range(len(pattern["ride"])):
+            # Add swing feel by adjusting timing
+            swing_offset = beat_duration * 0.2 if i % 2 == 1 else 0
+            current_time = measure_start + ((i // 2) * beat_duration) + swing_offset
+
+            # Add each drum hit
+            for drum_type in ["ride", "hihat", "kick", "snare"]:
+                # Use variation if selected
+                if use_variation and drum_type in ["kick", "snare"]:
+                    current_pattern = random.choice(pattern["variations"])
+                else:
+                    current_pattern = pattern[drum_type]
+
+                hit = current_pattern[i % len(current_pattern)]
+                if hit["velocity"] > 0:
+                    note = pretty_midi.Note(
+                        velocity=hit["velocity"],
+                        pitch=hit["pitch"],
+                        start=current_time,
+                        end=current_time + (beat_duration * 0.9)
+                    )
+                    drums.notes.append(note)
+
+    sequence.instruments.append(drums)
+    return sequence
+
+def merge_sequences(sequences):
+    """Merge multiple sequences with proper timing"""
+    merged = pretty_midi.PrettyMIDI()
+    merged.resolution = 480  # Add this line
+    current_time = 0.0
+
+    for seq in sequences:
+        # Create new instruments for this sequence
+        for inst in seq.instruments:
+            new_inst = pretty_midi.Instrument(
+                program=inst.program,
+                is_drum=inst.is_drum,
+                name=inst.name
+            )
+
+            # Add notes with adjusted timing
+            for note in inst.notes:
+                new_note = pretty_midi.Note(
+                    velocity=note.velocity,
+                    pitch=note.pitch,
+                    start=note.start + current_time,
+                    end=note.end + current_time
+                )
+                new_inst.notes.append(new_note)
+
+            merged.instruments.append(new_inst)
+
+        # Update current time
+        current_time += seq.get_end_time() + 0.5  # Add small gap between sequences
+
+    return merged
+
+def get_chord_scale(root, quality):
+    """Get appropriate scale for a chord"""
+    # Map chord qualities to scale types
+    scale_map = {
+        "maj7": "ionian",
+        "7": "mixolydian",
+        "m7": "dorian",
+        "m7b5": "locrian",
+        "dim7": "diminished"
+    }
+
+    scale_type = scale_map.get(quality, "ionian")
+    return generate_scale(root, scale_type)
+
+def get_next_chord_root(sequence, time):
+    """Get the root of the next chord after given time"""
+    for note in sequence.instruments[0].notes:
+        if note.start > time:
+            # Get the lowest note in the chord at this time
+            chord_notes = []
+            for n in sequence.instruments[0].notes:
+                if abs(n.start - note.start) < 0.01:  # Notes that start at the same time
+                    chord_notes.append(n.pitch)
+            if chord_notes:
+                return min(chord_notes) - 24  # Return the lowest note, two octaves down
+    return None
+
+def create_chromatic_approach(current, target):
+    """Create chromatic approach note to target"""
+    if target is None:
+        return current
+
+    if target > current:
+        return target - 1
+    else:
+        return target + 1
+
+# Add jazz standards database
+class JazzStandard(BaseModel):
+    name: str
+    composer: Optional[str] = None
+    year: Optional[int] = None
+    changes: List[str]  # Using List from typing instead of list[]
+    form: str
+    style: str
+    tempo_range: Tuple[int, int] = (120, 240)
+    key: str
+    difficulty: Optional[str] = None
+    common_subs: Optional[List[str]] = None
+
+# Example jazz standards database (just structure, not actual changes)
+JAZZ_STANDARDS = {
+    "blues": {
+        "name": "Basic Blues",
+        "form": "12-bar",
+        "style": "swing",
+        "changes": ["I7", "I7", "I7", "I7",
+                   "IV7", "IV7", "I7", "I7",
+                   "V7", "IV7", "I7", "V7"]
+    },
+    "rhythm_changes": {
+        "name": "Rhythm Changes",
+        "form": "AABA",
+        "style": "swing",
+        "changes": ["Bbmaj7", "G7", "Cm7", "F7",
+                   "Bbmaj7", "G7", "Cm7", "F7",
+                   "Cm7", "F7", "Bb7", "Eb7",
+                   "Cm7", "F7", "Bbmaj7", "F7"]
+    },
+    "251": {
+        "name": "2-5-1 Progression",
+        "form": "4-bar",
+        "style": "swing",
+        "changes": ["Dm7", "G7", "Cmaj7", "Cmaj7"]
+    },
+    "minor251": {
+        "name": "Minor 2-5-1",
+        "form": "4-bar",
+        "style": "swing",
+        "changes": ["Dm7b5", "G7b9", "Cm7", "Cm7"]
+    },
+    "inner_urge": {
+        "name": "Inner Urge",
+        "form": "AABA",
+        "style": "latin",
+        "changes": ["Fmaj7", "F#maj7", "Bmaj7", "Emaj7",
+                   "Fmaj7", "F#maj7", "Bmaj7", "Emaj7",
+                   "Am7", "D7", "Gmaj7", "Cmaj7",
+                   "Fmaj7", "F#maj7", "Bmaj7", "Emaj7"]
+    }
+}
+
+@app.post("/get-standard-changes")
+async def get_standard_changes(name: str):
+    """Get chord changes for a jazz standard"""
+    try:
+        # Use the brain to safely get chord changes
+        response = await ask_gpt_or_generate_meme(
+            f"What are the basic chord changes for the jazz standard '{name}'? " +
+            "Please provide only the basic chord progression in Roman numerals or chord symbols, " +
+            "without any copyrighted melody or additional material."
+        )
+
+        # Parse the response and create a progression
+        progression = ChordProgression(
+            name=name,
+            chords=parse_changes_from_response(response),
+            style="swing"
+        )
+
+        return progression
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def parse_changes_from_response(response: str) -> List[str]:
+    """Parse chord changes from GPT response"""
+    # Remove any explanatory text and keep only chord symbols
+    lines = response.split('\n')
+    chords = []
+
+    for line in lines:
+        # Look for lines containing chord symbols or Roman numerals
+        if any(x in line for x in ["maj7", "m7", "7", "dim", "ø"]):
+            # Extract chord symbols
+            symbols = [s.strip() for s in line.split() if any(x in s for x in ["maj7", "m7", "7", "dim", "ø"])]
+            chords.extend(symbols)
+
+    return chords
+
+@app.post("/analyze-changes")
+async def analyze_changes(request: ChordProgression):
+    """Get chord progression and details for a jazz standard"""
+    try:
+        # Convert request name to lowercase and replace spaces with underscores
+        standard_name = request.name.lower().replace(" ", "_")
+
+        if standard_name not in JAZZ_STANDARDS:
+            raise HTTPException(status_code=404, detail=f"Standard '{request.name}' not found")
+
+        standard = JAZZ_STANDARDS[standard_name]
+        return {
+            "name": request.name,
+            "chords": standard["chords"],
+            "tempo": standard["tempo"],
+            "style": "swing"  # Default to swing for jazz standards
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class SheetMusicAnalysis(BaseModel):
+    """Analysis results from sheet music"""
+    melody: List[Dict[str, Any]]
+    harmony: List[Dict[str, Any]]
+    form: Dict[str, Any]
+    style_markers: List[str]
+    suggested_concepts: List[str]
+    key: str
+    time_signature: str
+    visualization: Dict[str, Any]
+
+@app.post("/analyze-sheet-music")
+async def analyze_sheet_music(
+    file: UploadFile = File(...),
+    generate_audio: bool = True,
+    creative_response: bool = True
+):
+    """Analyze uploaded sheet music (PDF or image) and provide insights"""
+    try:
+        # Save uploaded file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        # Process based on file type
+        if file.filename.endswith('.pdf'):
+            # Convert PDF to music21 score
+            score = converter.parse(temp_path)
+        else:
+            # Use OCR for image
+            score = await process_sheet_music_image(temp_path)
+
+        # Analyze the score
+        analysis = {
+            "melody": extract_melody_info(score),
+            "harmony": extract_harmony_info(score),
+            "form": analyze_form(score),
+            "style": analyze_style(score)
+        }
+
+        # Generate audio if requested
+        audio = None
+        if generate_audio:
+            midi_data = score.write('midi')
+            audio = midi_synth.synthesize(midi_data, sample_rate=44100)
+
+        # Get creative suggestions if requested
+        creative = None
+        if creative_response:
+            creative = await ask_gpt_or_generate_meme(
+                f"Analyze this piece musically and suggest creative ways to develop these ideas: {analysis}. " +
+                "Include specific practice suggestions and theoretical concepts to explore."
+            )
+
+        return {
+            "analysis": analysis,
+            "audio": encode_audio(audio) if audio else None,
+            "creative_response": creative
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/transcribe-audio")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    generate_sheet_music: bool = True
+):
+    """Transcribe uploaded audio and provide sheet music"""
+    try:
+        # Save uploaded audio
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        # Load and process audio
+        y, sr = librosa.load(temp_path)
+
+        # Extract musical features
+        notes = extract_notes(y, sr)
+        chords = extract_chords(y, sr)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        key = estimate_key(y, sr)
+
+        # Create music21 score from transcription
+        score = create_score_from_transcription(notes, chords, tempo, key)
+
+        # Generate sheet music if requested
+        sheet_music = None
+        if generate_sheet_music:
+            sheet_music = score.write('musicxml')
+
+        return {
+            "transcription": {
+                "notes": notes,
+                "chords": chords,
+                "tempo": tempo,
+                "key": key
+            },
+            "sheet_music": base64.b64encode(sheet_music).decode() if sheet_music else None,
+            "visualization": create_transcription_visualization(notes, chords, beats)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Helper functions
+def extract_melody_info(score: stream.Score) -> List[Dict[str, Any]]:
+    """Extract melodic information from score"""
+    melody_info = []
+    for n in score.flatten().getElementsByClass('Note'):
+        melody_info.append({
+            "pitch": n.nameWithOctave,
+            "duration": n.duration.quarterLength,
+            "offset": n.offset
+        })
+    return melody_info
+
+def extract_harmony_info(score: stream.Score) -> List[Dict[str, Any]]:
+    """Extract harmonic information from score"""
+    harmony_info = []
+    for c in score.flatten().getElementsByClass('ChordSymbol'):
+        harmony_info.append({
+            "symbol": c.figure,
+            "duration": c.duration.quarterLength,
+            "offset": c.offset
+        })
+    return harmony_info
+
+def analyze_form(score: stream.Score) -> Dict[str, Any]:
+    """Analyze form of the piece"""
+    sections = []
+    for i, m in enumerate(score.measureStream):
+        if m.rightBarline and m.rightBarline.type != 'regular':
+            sections.append({
+                "end_measure": i,
+                "harmony": extract_harmony_info(m)
+            })
+    return {"sections": sections}
+
+def analyze_style(score: stream.Score) -> Dict[str, Any]:
+    """Analyze stylistic elements of the piece"""
+    style_info = {
+        "genre_indicators": detect_genre(score),
+        "rhythmic_patterns": analyze_rhythm(score),
+        "harmonic_patterns": analyze_harmony_patterns(score)
+    }
+    return style_info
+
+def extract_notes(y: np.ndarray, sr: int) -> List[Dict[str, Any]]:
+    """Extract note events from audio"""
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
+
+    notes = []
+    for i, onset in enumerate(onset_frames):
+        if i < len(onset_frames) - 1:
+            frame_slice = pitches[:, onset:onset_frames[i+1]]
+            mag_slice = magnitudes[:, onset:onset_frames[i+1]]
+
+            if len(mag_slice) > 0:
+                pitch_idx = np.unravel_index(np.argmax(mag_slice), mag_slice.shape)
+                freq = pitches[pitch_idx[0], onset + pitch_idx[1]]
+
+                if freq > 0:
+                    notes.append({
+                        "midi_note": int(librosa.hz_to_midi(freq)),
+                        "start_time": librosa.frames_to_time(onset, sr=sr),
+                        "duration": librosa.frames_to_time(onset_frames[i+1] - onset, sr=sr)
+                    })
+
+    return notes
+
+def extract_chords(y: np.ndarray, sr: int) -> List[Dict[str, Any]]:
+    """Extract chord progression from audio"""
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    chord_frames = librosa.segment.agglomerative(chroma, 12)
+
+    chords = []
+    for i in range(len(chord_frames) - 1):
+        chord_chroma = np.mean(chroma[:, chord_frames[i]:chord_frames[i+1]], axis=1)
+        chord_name = identify_chord(chord_chroma)
+
+        chords.append({
+            "symbol": chord_name,
+            "start_time": librosa.frames_to_time(chord_frames[i], sr=sr),
+            "end_time": librosa.frames_to_time(chord_frames[i+1], sr=sr)
+        })
+
+    return chords
+
+def create_score_from_transcription(
+    notes: List[Dict[str, Any]],
+    chords: List[Dict[str, Any]],
+    tempo: float,
+    key: str
+) -> stream.Score:
+    """Create music21 score from transcription data"""
+    score = stream.Score()
+
+    # Create melody part
+    melody = stream.Part()
+    for note_info in notes:
+        n = note.Note(midi=note_info["midi_note"])
+        n.duration.quarterLength = note_info["duration"]
+        melody.append(n)
+
+    # Create chord part
+    chord_part = stream.Part()
+    for chord_info in chords:
+        c = harmony.ChordSymbol(chord_info["symbol"])
+        c.duration.quarterLength = chord_info["end_time"] - chord_info["start_time"]
+        chord_part.append(c)
+
+    # Add parts to score
+    score.append(melody)
+    score.append(chord_part)
+
+    # Add metadata
+    score.insert(0, tempo.MetronomeMark(number=tempo))
+    score.insert(0, key)
+
+    return score
+
+def create_transcription_visualization(
+    notes: List[Dict[str, Any]],
+    chords: List[Dict[str, Any]],
+    beats: np.ndarray
+) -> Dict[str, Any]:
+    """Create visualization data for transcription"""
+    return {
+        "piano_roll": create_piano_roll(notes),
+        "chord_progression": create_chord_progression_viz(chords),
+        "beat_markers": beats.tolist()
+    }
+
+# ... rest of existing code ...
+
+class JazzAnalysis(BaseModel):
+    """Jazz-specific musical analysis results"""
+    chord_progression: List[str]
+    key: str
+    mode: str
+    secondary_dominants: List[str]
+    modulations: List[Dict[str, Any]]
+    voice_leading: List[Dict[str, Any]]
+    form: Dict[str, Any]
+    extensions: List[str]
+    substitutions: List[Dict[str, Any]]
+    reharmonization: List[Dict[str, Any]]
+    modal_interchange: List[Dict[str, Any]]
+    rhythmic_feel: str
+    swing_ratio: float
+
+def analyze_jazz_harmony(audio_data: np.ndarray, sr: int) -> JazzAnalysis:
+    """Analyze jazz harmony in audio data"""
+    # ... rest of the function ...
+
+@app.post("/analyze-jazz-content")
+async def analyze_jazz_content(
+    file: UploadFile = File(...),
+    content_type: str = "audio",  # or "sheet_music"
+    generate_examples: bool = True
+):
+    """Analyze jazz content (sheet music or audio) with detailed insights"""
+    try:
+        # Save uploaded file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        # Load and process audio
+        y, sr = librosa.load(temp_path)
+
+        # Extract musical features
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        notes = extract_notes(y, sr)
+        chords = extract_chords(y, sr)
+        key = estimate_key(y, sr)
+
+        # Create basic analysis
+        analysis = {
+            "technical_details": {
+                "tempo": float(tempo),
+                "key_signature": key,
+                "time_signature": "4/4",  # Default for now
+                "total_time": float(len(y)) / sr,
+                "note_count": len(notes),
+                "notes": notes,
+                "beats": beats.tolist()
+            },
+            "musical_analysis": {
+                "key": key,
+                "chord_progression": chords,
+                "style_markers": identify_style_markers(y, sr),
+                "suggested_scales": suggest_scales(key, chords)
+            }
+        }
+
+        # Get practice suggestions from GPT
+        suggestions = await ask_gpt_or_generate_meme(
+            "Analyze this jazz performance and suggest practice approaches. " +
+            f"Key: {key}, Tempo: {tempo}, Chords: {chords}. " +
+            "Include specific exercises for developing vocabulary and concepts."
+        )
+
+        analysis["practice_suggestions"] = suggestions
+
+        return analysis
+
+    except Exception as e:
+        print(f"Error in analyze_jazz_content: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def identify_style_markers(y: np.ndarray, sr: int) -> List[str]:
+    """Identify jazz style markers in audio"""
+    markers = []
+
+    # Detect swing feel
+    if has_swing_feel(y, sr):
+        markers.append("swing")
+
+    # Detect walking bass
+    if has_walking_bass(y, sr):
+        markers.append("walking_bass")
+
+    # Detect bebop lines
+    if has_bebop_lines(y, sr):
+        markers.append("bebop")
+
+    return markers
+
+def has_swing_feel(y: np.ndarray, sr: int) -> bool:
+    """Detect swing feel in audio"""
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+
+    # Calculate swing ratio
+    if len(beats) > 1:
+        beat_times = librosa.frames_to_time(beats, sr=sr)
+        intervals = np.diff(beat_times)
+        swing_ratio = np.mean(intervals[::2]) / np.mean(intervals[1::2])
+        return abs(swing_ratio - 1.5) < 0.3  # Typical swing ratio is around 1.5
+
+    return False
+
+def has_walking_bass(y: np.ndarray, sr: int) -> bool:
+    """Detect walking bass pattern"""
+    # Extract bass frequencies
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+    frequencies = librosa.feature.spectral_centroid(y=y_harmonic, sr=sr)
+
+    # Check for regular bass movement
+    onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr,
+                                           fmax=250)  # Focus on bass frequencies
+    tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+
+    return len(beats) > 0 and 100 <= tempo <= 300
+
+def has_bebop_lines(y: np.ndarray, sr: int) -> bool:
+    """Detect bebop-style melodic lines"""
+    # Extract pitch
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+
+    # Look for rapid note changes
+    note_changes = np.diff(np.argmax(magnitudes, axis=0))
+    rapid_changes = np.sum(np.abs(note_changes) > 2) / len(note_changes)
+
+    return rapid_changes > 0.3  # Threshold for rapid note changes
+
+def suggest_scales(key: str, chords: List[Dict[str, Any]]) -> List[str]:
+    """Suggest scales based on key and chord progression"""
+    scales = []
+
+    # Add basic scales
+    scales.append(f"{key} major")
+    scales.append(f"{key} minor")
+    scales.append(f"{key} dorian")
+    scales.append(f"{key} mixolydian")
+
+    # Add scales based on chord types
+    for chord in chords:
+        if "7" in chord["symbol"]:
+            scales.append(f"{chord['symbol'].split('7')[0]} bebop")
+        if "m7" in chord["symbol"]:
+            scales.append(f"{chord['symbol'].split('m7')[0]} dorian")
+
+    return list(set(scales))  # Remove duplicates
+
+def get_chord_intervals(quality: str) -> List[int]:
+    """Get intervals for chord quality"""
+    # Define common chord intervals
+    intervals = {
+        "maj": [0, 4, 7],           # Major triad
+        "maj7": [0, 4, 7, 11],      # Major seventh
+        "7": [0, 4, 7, 10],         # Dominant seventh
+        "min": [0, 3, 7],           # Minor triad (primary form)
+        "min7": [0, 3, 7, 10],      # Minor seventh (primary form)
+        "min9": [0, 3, 7, 10, 14],  # Minor ninth
+        "min11": [0, 3, 7, 10, 14, 17],  # Minor eleventh
+        "min13": [0, 3, 7, 10, 14, 17, 21],  # Minor thirteenth
+        "dim": [0, 3, 6],           # Diminished triad
+        "dim7": [0, 3, 6, 9],       # Diminished seventh
+        "min7b5": [0, 3, 6, 10],    # Half-diminished
+        "aug": [0, 4, 8],           # Augmented
+        "sus4": [0, 5, 7],          # Suspended fourth
+        "sus2": [0, 2, 7],          # Suspended second
+        "6": [0, 4, 7, 9],          # Major sixth
+        "min6": [0, 3, 7, 9],       # Minor sixth
+        "9": [0, 4, 7, 10, 14],     # Dominant ninth
+        "maj9": [0, 4, 7, 11, 14],  # Major ninth
+        "m9": [0, 3, 7, 10, 14]   # Minor ninth
+    }
+
+    # Handle common variations
+    quality_map = {
+        "": "maj",
+        "M": "maj",
+        "M7": "maj7",
+        "-": "min",      # Map to min instead of m
+        "-7": "min7",    # Map to min7 instead of m7
+        "ø": "min7b5",
+        "o": "dim",
+        "+": "aug",
+        "m": "min",      # Legacy support
+        "m7": "min7",    # Legacy support
+        "m9": "min9",    # Legacy support
+    }
+
+    # Clean up quality string and map to standard form
+    quality = quality.strip()
+    standard_quality = quality_map.get(quality, quality)
+
+    # Return intervals for the quality, defaulting to major triad if not found
+    return intervals.get(standard_quality, intervals["maj"])
+
+def add_comping_rhythm(sequence: pretty_midi.PrettyMIDI, style: str) -> pretty_midi.PrettyMIDI:
+    """Add appropriate comping rhythm to the sequence"""
+    try:
+        # Create a new piano track for comping
+        comping_piano = pretty_midi.Instrument(
+            program=pretty_midi.instrument_name_to_program('Acoustic Grand Piano')
+        )
+
+        # Get timing info from the sequence's initial tempo
+        tempo = getattr(sequence, 'initial_tempo', 120)  # Default to 120 if not set
+        seconds_per_beat = 60.0 / tempo
+        measure_duration = seconds_per_beat * 4  # Assuming 4/4 time
+
+        if sequence.instruments and sequence.instruments[0].notes:
+            end_time = max(note.end for note in sequence.instruments[0].notes)
+            num_measures = max(2, int(end_time / measure_duration) + 1)
+        else:
+            return sequence
+
+        # Add comping pattern based on style
+        if style == "swing":
+            # Swing comping pattern (2 and 4)
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chords on beats 2 and 4
+                for beat in [1, 3]:  # 0-based, so 1 and 3 are beats 2 and 4
+                    beat_time = measure_start + (beat * seconds_per_beat)
+                    # Get the chord at this time
+                    chord_notes = get_chord_notes_at_time(sequence, beat_time)
+                    if chord_notes:
+                        # Add each note in the chord
+                        for note_num in chord_notes:
+                            note = pretty_midi.Note(
+                                velocity=70,  # Slightly softer than melody
+                                pitch=note_num,
+                                start=beat_time,
+                                end=beat_time + (seconds_per_beat * 0.8)  # Slightly shorter for articulation
+                            )
+                            comping_piano.notes.append(note)
+
+        elif style == "latin":
+            # Latin comping pattern (syncopated)
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chords on the "and" of beats 2 and 4
+                for beat in [1.5, 3.5]:
+                    beat_time = measure_start + (beat * seconds_per_beat)
+                    chord_notes = get_chord_notes_at_time(sequence, beat_time)
+                    if chord_notes:
+                        for note_num in chord_notes:
+                            note = pretty_midi.Note(
+                                velocity=75,
+                                pitch=note_num,
+                                start=beat_time,
+                                end=beat_time + (seconds_per_beat * 0.5)
+                            )
+                            comping_piano.notes.append(note)
+
+        else:  # Default to basic pattern
+            for measure in range(num_measures):
+                measure_start = measure * measure_duration
+                # Add chord on beat 1
+                chord_notes = get_chord_notes_at_time(sequence, measure_start)
+                if chord_notes:
+                    for note_num in chord_notes:
+                        note = pretty_midi.Note(
+                            velocity=80,
+                            pitch=note_num,
+                            start=measure_start,
+                            end=measure_start + (measure_duration * 0.9)
+                        )
+                        comping_piano.notes.append(note)
+
+        sequence.instruments.append(comping_piano)
+        return sequence
+
+    except Exception as e:
+        print(f"Error in add_comping_rhythm: {str(e)}")
+        return sequence
+
+def load_from_corpus(song_title: str) -> Optional[str]:
+    """Load a song from the Jazz Chord Progressions Corpus if it exists"""
+    # Clean the title for filename matching (remove articles, lowercase, etc)
+    clean_title = song_title.lower()
+    for article in ['the ', 'a ', 'an ']:
+        if clean_title.startswith(article):
+            clean_title = clean_title[len(article):]
+    clean_title = re.sub(r'[^a-z0-9]', '', clean_title)
+
+    # Define corpus directories relative to our workspace
+    corpus_dirs = [
+        'corpus/SongDB/Songs[#,A-G]',
+        'corpus/SongDB/Songs[H-O]',
+        'corpus/SongDB/Songs[P-Z]'
+    ]
+
+    # Search for the song in each directory
+    for dir in corpus_dirs:
+        try:
+            files = os.listdir(dir)
+            matches = [f for f in files if clean_title in f.lower()]
+            if matches:
+                with open(os.path.join(dir, matches[0]), 'r') as f:
+                    content = f.read()
+                    print(f"\nFound in corpus: {matches[0]}")
+                    return content
+        except FileNotFoundError:
+            print(f"Directory not found: {dir}")
+            continue
+
+    print(f"\nSong '{song_title}' not found in corpus, falling back to GPT")
+    return None
+
+def chord_to_midi_notes(chord: str, complexity: float = 0.5) -> List[int]:
+    """Convert a chord symbol to a list of MIDI note numbers"""
+    root, quality = parse_chord_symbol(chord)
+    root_num = pretty_midi.note_name_to_number(root + "4")
+
+    # Base intervals for different qualities
+    intervals = []
+
+    # Set up base triad
+    if any(x in quality for x in ['m', 'min']):
+        intervals = [0, 3, 7]  # Minor triad
+    elif 'dim' in quality:
+        intervals = [0, 3, 6]  # Diminished triad
+    elif 'aug' in quality:
+        intervals = [0, 4, 8]  # Augmented triad
+    elif 'sus4' in quality:
+        intervals = [0, 5, 7]  # Suspended fourth
+    else:
+        intervals = [0, 4, 7]  # Major triad
+
+    # Add sevenths
+    if 'maj7' in quality:
+        intervals.append(11)  # Major seventh
+    elif any(x in quality for x in ['7', '9', '11', '13']):
+        intervals.append(10)  # Dominant seventh
+    elif '6' in quality:
+        intervals.append(9)   # Sixth
+
+    # Add extensions (ensuring proper inclusion of lower extensions)
+    if '13' in quality:
+        intervals.extend([14, 17, 21])  # Add 9, 11, 13
+    elif '11' in quality:
+        intervals.extend([14, 17])      # Add 9, 11
+    elif '9' in quality:
+        intervals.append(14)            # Add 9
+
+    # Handle alterations
+    if 'b5' in quality:
+        intervals = [i if i != 7 else 6 for i in intervals]
+    if '#5' in quality:
+        intervals = [i if i != 7 else 8 for i in intervals]
+    if 'b9' in quality:
+        intervals = [i if i != 14 else 13 for i in intervals]
+    if '#9' in quality:
+        intervals = [i if i != 14 else 15 for i in intervals]
+    if '#11' in quality:
+        intervals.append(18)
+    if 'b13' in quality:
+        intervals.append(20)
+
+    # Convert intervals to MIDI notes
+    notes = [root_num + interval for interval in intervals]
+
+    # Apply voicing spacing
+    return space_voicing(notes, complexity)
+
+def space_voicing(notes: List[int], complexity: float) -> List[int]:
+    """Apply proper jazz voicing spacing"""
+    if not notes:
+        return []
+
+    # Sort notes
+    notes.sort()
+
+    # Keep root in bass
+    result = [notes[0]]
+
+    # Space remaining notes based on complexity
+    remaining = notes[1:]
+    current_octave = 0
+
+    for note in remaining:
+        # More complex voicings will have wider spacing
+        min_spacing = 2 if complexity < 0.5 else 3
+        while note + (current_octave * 12) - result[-1] < min_spacing:
+            current_octave += 1
+        result.append(note + (current_octave * 12))
+
+    return result
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=3000,
+        workers=1,  # Single worker for development
+        loop="uvloop"  # Use uvloop for better performance
+    )

@@ -1,0 +1,1118 @@
+import os
+import logging
+import json
+import datetime
+import openai
+import httpx
+import re
+import random
+import time
+import feedparser
+import newspaper
+import yaml
+from pathlib import Path
+from newspaper import Article
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any, Optional, Union, Set
+import asyncio
+from narrative_engine import NarrativeEngine
+from collections import defaultdict
+from thelonious_debug import TheloniousLogger
+from jam_session_analyzer import MusicalBackroomsAnalyzer
+from theoretical_engine import TheoreticalEngine
+from pydantic import BaseModel
+from openai import OpenAI
+from logging.handlers import RotatingFileHandler
+
+# Initialize OpenAI API key and client
+API_KEY = "REDACTED_OPENAI_KEY"
+try:
+    client = OpenAI(
+        api_key=API_KEY,
+        max_retries=1,
+        timeout=15.0
+    )
+    openai.api_key = API_KEY  # Keep this for backward compatibility
+except Exception as e:
+    print(f"\n❌ Error initializing OpenAI client: {str(e)}")
+    raise
+
+# Initialize logger with global scope
+logger = TheloniousLogger()
+
+# Initialize logging with proper rotation
+# Create logs directory if it doesn't exist
+log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+# Set up rotating file handler
+log_file = os.path.join(log_dir, 'interaction_log.txt')
+handler = RotatingFileHandler(
+    log_file,
+    maxBytes=10485760,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(handler)
+
+class Message(BaseModel):
+    """Message model for GPT requests"""
+    text: str
+    model: str = "gpt-4"
+    temperature: float = 0.7
+    max_tokens: int = 500
+    top_p: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+
+class MusicAnalyzer:
+    def __init__(self, api_key=None):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OpenAI API key is required")
+
+    def clean_song_title(self, prompt: str) -> str:
+        """Clean the prompt to extract just the song title."""
+        # Extract style and feel information
+        style_pattern = r'\s+(?:in|with)\s+[\w\s]+?\s*(?:style|feel)'
+
+        # Remove style/feel descriptors
+        cleaned = re.sub(style_pattern, '', prompt, flags=re.IGNORECASE).strip()
+
+        # Remove any remaining 'in' or 'with' at the end
+        cleaned = re.sub(r'\s+(?:in|with)\s*$', '', cleaned, flags=re.IGNORECASE).strip()
+
+        # If nothing left after cleaning, return original prompt
+        return cleaned if cleaned else prompt
+
+    def load_from_corpus(self, title: str) -> Optional[str]:
+        """Load song from corpus if it exists."""
+        # Define style/feel combinations
+        styles = {
+            'swing': ['Medium Swing', 'Fast Swing', 'Ballad', 'Waltz'],
+            'latin': ['Bossa Nova', 'Samba', 'Salsa', 'Montuno'],
+            'funk': ['Straight 8ths', 'Sixteenth', 'Half-time', 'Double-time'],
+            'modal': ['So What', 'Impressions', 'India', 'Maiden Voyage']
+        }
+
+        # Extract style and feel from title if present
+        requested_style = None
+        requested_feel = None
+
+        for style, feels in styles.items():
+            if style.lower() in title.lower():
+                requested_style = style
+                for feel in feels:
+                    if feel.lower() in title.lower():
+                        requested_feel = feel
+                        break
+                break
+
+        # Clean the title first
+        title = self.clean_song_title(title)
+
+        # Skip corpus search for obviously non-song inputs
+        if not title or len(title) < 3:  # Skip very short titles
+            return None
+
+        # Define corpus directories
+        corpus_dirs = [
+            'corpus/SongDB/Songs[#,A-G]',
+            'corpus/SongDB/Songs[H-O]',
+            'corpus/SongDB/Songs[P-Z]'
+        ]
+
+        # Try to find the song file
+        for directory in corpus_dirs:
+            try:
+                # Skip if directory doesn't exist
+                if not os.path.exists(directory):
+                    continue
+
+                # Check each file in directory
+                for filename in os.listdir(directory):
+                    if filename.endswith('.txt'):
+                        # Convert title to match filename format
+                        search_title = ''.join(c for c in title if c.isalnum())
+                        file_title = ''.join(c for c in filename[:-4] if c.isalnum())
+
+                        if search_title.lower() == file_title.lower():
+                            with open(os.path.join(directory, filename), 'r') as f:
+                                content = f.read()
+                                print(f"\nFound in corpus: {filename}")
+
+                                # If style/feel was requested, add it to the content
+                                if requested_style and requested_feel:
+                                    # Check if content already has Style and Feel fields
+                                    if 'Style = ' not in content:
+                                        # Find where to insert style/feel (after Form line)
+                                        lines = content.split('\n')
+                                        form_index = next((i for i, line in enumerate(lines) if line.startswith('Form = ')), -1)
+                                        if form_index != -1:
+                                            lines.insert(form_index + 1, f'Style = {requested_style}')
+                                            lines.insert(form_index + 2, f'Feel = {requested_feel}')
+                                            content = '\n'.join(lines)
+
+                                return content
+            except Exception as e:
+                print(f"Error reading directory {directory}: {str(e)}")
+                continue
+
+        print(f"\nSong '{title}' not found in corpus, falling back to GPT")
+        return None
+
+    async def get_gpt_response(self, prompt: str) -> str:
+        """Get response from GPT."""
+        try:
+            # Clean the prompt for better GPT understanding
+            cleaned_prompt = self.clean_song_title(prompt)
+
+            async with httpx.AsyncClient(timeout=30.0) as client:  # Increased timeout to 30 seconds
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": "gpt-4",
+                        "messages": [
+                            {"role": "system", "content": """You are Bird AI, a jazz expert. When discussing music or chord progressions, respond in EXACTLY this format:
+
+Title = [Song Title]
+Form = [Song Form, e.g. AABA, Blues, etc.]
+Key = [Main key of the song]
+Style = [Requested style or default to swing]
+Feel = [Requested feel or default to medium swing]
+Tempo = [Tempo in BPM]
+Length = [Number of measures]
+Time = [Time signature]
+Changes = [Chord progression with each measure separated by |, use 'x' for repeat]
+
+For complex tunes like Giant Steps, Countdown, or other Coltrane changes:
+1. Use exact chord voicings and substitutions
+2. Include all key centers and modulations
+3. Mark each 4-bar phrase clearly
+4. For Giant Steps specifically, use the standard 16-bar form with accurate key centers (B, G, Eb)
+
+Example for Giant Steps:
+Changes = |Bmaj7 D7 |Gmaj7 Bb7 |Ebmaj7 |Am7 D7 |Gmaj7 Bb7 |Ebmaj7 F#7 |Bmaj7 |Fm7 Bb7 |Ebmaj7 |Am7 D7 |Gmaj7 |C#m7 F#7 |Bmaj7 |Fm7 Bb7 |Ebmaj7 |C#m7 F#7 |"""},
+                            {"role": "user", "content": cleaned_prompt}
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 500,
+                        "top_p": 1,
+                        "frequency_penalty": 0,
+                        "presence_penalty": 0
+                    }
+                )
+
+                if response.status_code != 200:
+                    logging.error(f"API returned status {response.status_code}: {response.text}")
+                    raise Exception(f"API returned status {response.status_code}")
+
+                result = response.json()
+                content = result['choices'][0]['message']['content']
+
+                # Validate response format
+                required_fields = ["Title", "Form", "Key", "Style", "Feel", "Tempo", "Length", "Time", "Changes"]
+                for field in required_fields:
+                    if f"{field} = " not in content:
+                        logging.warning(f"Missing required field: {field}")
+                        raise ValueError(f"Response missing required field: {field}")
+
+                return content
+
+        except Exception as e:
+            logging.error(f"Error getting GPT response: {e}")
+            # Return a default response for Giant Steps
+            if "giant steps" in prompt.lower():
+                return """Title = Giant Steps
+Form = AABA
+Key = B
+Style = swing
+Feel = medium swing
+Tempo = 270
+Length = 16
+Time = 4/4
+Changes = |Bmaj7 D7 |Gmaj7 Bb7 |Ebmaj7 |Am7 D7 |Gmaj7 Bb7 |Ebmaj7 F#7 |Bmaj7 |Fm7 Bb7 |Ebmaj7 |Am7 D7 |Gmaj7 |C#m7 F#7 |Bmaj7 |Fm7 Bb7 |Ebmaj7 |C#m7 F#7 |"""
+            else:
+                raise e
+
+    async def analyze_music(self, prompt: str, source: str = "unknown", retries: int = 3) -> str:
+        """Analyze musical request and generate appropriate response."""
+        for attempt in range(retries):
+            try:
+                # Define style/feel combinations from the UI
+                styles = {
+                    'swing': ['Medium Swing', 'Fast Swing', 'Ballad', 'Waltz'],
+                    'latin': ['Bossa Nova', 'Samba', 'Salsa', 'Montuno'],
+                    'funk': ['Straight 8ths', 'Sixteenth', 'Half-time', 'Double-time'],
+                    'modal': ['So What', 'Impressions', 'India', 'Maiden Voyage']
+                }
+
+                # Check if this is a style/feel request
+                is_style_request = False
+                requested_style = None
+                requested_feel = None
+
+                for style, feels in styles.items():
+                    if style.lower() in prompt.lower():
+                        requested_style = style
+                        for feel in feels:
+                            if feel.lower() in prompt.lower():
+                                requested_feel = feel
+                                is_style_request = True
+                                break
+                        if is_style_request:
+                            break
+
+                # Check if this is a music generation request
+                is_music_request = is_style_request or any(keyword in prompt.lower() for keyword in [
+                    "play", "progression", "changes", "chord", "tune", "song",
+                    "blues in", "rhythm changes in", "251 in", "autumn leaves"
+                ])
+
+                if not is_music_request:
+                    # Handle conversational queries
+                    system_prompt = """You are Bird AI, a friendly and knowledgeable jazz expert with a distinct personality.
+                    You're passionate about jazz and love sharing your knowledge. Respond conversationally, as if chatting
+                    with a student or fellow musician. Share anecdotes, give practical advice, and maintain a warm,
+                    encouraging tone."""
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                else:
+                    # Handle music generation requests with strict format
+                    system_prompt = """You are Bird AI, a jazz expert. When discussing music or chord progressions, respond in EXACTLY this format:
+
+Title = [song title]
+ComposedBy = [composer name]
+Form = [form type, e.g. AABA, Blues, Rhythm Changes]
+Style = [style: swing, latin, funk, modal]
+Feel = [feel based on style]
+DBKeySig = [key, e.g. B, Eb, F#]
+TimeSig = [time signature, e.g. 4 4]
+Bars = [number of bars]
+[chord progression with bar lines, e.g. Am7 | D7 | Gmaj7 | Cmaj7 |]
+
+IMPORTANT: Always include the chord progression with bar lines, even for well-known standards.
+For style/feel combinations:
+- swing: Medium Swing, Fast Swing, Ballad, Waltz
+- latin: Bossa Nova, Samba, Salsa, Montuno
+- funk: Straight 8ths, Sixteenth, Half-time, Double-time
+- modal: So What, Impressions, India, Maiden Voyage"""
+
+                    # If style/feel is specified, include it in the prompt
+                    if is_style_request:
+                        user_prompt = f"Show me a progression in {requested_style} style with {requested_feel} feel based on: {prompt}"
+                    else:
+                        user_prompt = f"Show me the chord progression for {prompt} with bar lines"
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {openai.api_key}"},
+                        json={
+                            "model": "gpt-4",
+                            "messages": messages,
+                            "temperature": 0.7 if not is_music_request else 0,  # Add variety to conversational responses
+                            "max_tokens": 500
+                        },
+                        timeout=30.0
+                    )
+
+                    if response.status_code != 200:
+                        raise Exception(f"API returned status {response.status_code}")
+
+                    result = response.json()
+                    return result['choices'][0]['message']['content']
+
+            except Exception as e:
+                logging.error(f"Error in analyze_music (attempt {attempt + 1}): {str(e)}")
+                if attempt == retries - 1:
+                    return "I apologize, but I'm having trouble processing that request right now. Could you try rephrasing it?"
+                await asyncio.sleep(1)
+
+        return "I apologize, but I'm having trouble processing that request right now. Could you try rephrasing it?"
+
+# Initialize global analyzer instance
+music_analyzer = MusicAnalyzer()
+
+# Export for use in other modules
+__all__ = ['music_analyzer', 'analyze_music']
+
+async def analyze_music(prompt: str, source: str = "unknown", retries: int = 3) -> str:
+    """Analyze musical request and generate appropriate response."""
+    for attempt in range(retries):
+        try:
+            # Define style/feel combinations from the UI
+            styles = {
+                'swing': ['Medium Swing', 'Fast Swing', 'Ballad', 'Waltz'],
+                'latin': ['Bossa Nova', 'Samba', 'Salsa', 'Montuno'],
+                'funk': ['Straight 8ths', 'Sixteenth', 'Half-time', 'Double-time'],
+                'modal': ['So What', 'Impressions', 'India', 'Maiden Voyage']
+            }
+
+            # Check if this is a style/feel request
+            is_style_request = False
+            requested_style = None
+            requested_feel = None
+
+            for style, feels in styles.items():
+                if style.lower() in prompt.lower():
+                    requested_style = style
+                    for feel in feels:
+                        if feel.lower() in prompt.lower():
+                            requested_feel = feel
+                            is_style_request = True
+                            break
+                    if is_style_request:
+                        break
+
+            # Check if this is a music generation request
+            is_music_request = is_style_request or any(keyword in prompt.lower() for keyword in [
+                "play", "progression", "changes", "chord", "tune", "song",
+                "blues in", "rhythm changes in", "251 in", "autumn leaves"
+            ])
+
+            if not is_music_request:
+                # Handle conversational queries
+                system_prompt = """You are Bird AI, a friendly and knowledgeable jazz expert with a distinct personality.
+                You're passionate about jazz and love sharing your knowledge. Respond conversationally, as if chatting
+                with a student or fellow musician. Share anecdotes, give practical advice, and maintain a warm,
+                encouraging tone."""
+
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+            else:
+                # Handle music generation requests with strict format
+                system_prompt = """You are Bird AI, a jazz expert. When discussing music or chord progressions, respond in EXACTLY this format:
+
+Title = [song title]
+ComposedBy = [composer name]
+Form = [form type, e.g. AABA, Blues, Rhythm Changes]
+Style = [style: swing, latin, funk, modal]
+Feel = [feel based on style]
+DBKeySig = [key, e.g. B, Eb, F#]
+TimeSig = [time signature, e.g. 4 4]
+Bars = [number of bars]
+[chord progression with bar lines, e.g. Am7 | D7 | Gmaj7 | Cmaj7 |]
+
+IMPORTANT: Always include the chord progression with bar lines, even for well-known standards.
+For style/feel combinations:
+- swing: Medium Swing, Fast Swing, Ballad, Waltz
+- latin: Bossa Nova, Samba, Salsa, Montuno
+- funk: Straight 8ths, Sixteenth, Half-time, Double-time
+- modal: So What, Impressions, India, Maiden Voyage"""
+
+                # If style/feel is specified, include it in the prompt
+                if is_style_request:
+                    user_prompt = f"Show me a progression in {requested_style} style with {requested_feel} feel based on: {prompt}"
+                else:
+                    user_prompt = f"Show me the chord progression for {prompt} with bar lines"
+
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai.api_key}"},
+                    json={
+                        "model": "gpt-4",
+                        "messages": messages,
+                        "temperature": 0.7 if not is_music_request else 0,  # Add variety to conversational responses
+                        "max_tokens": 500
+                    },
+                    timeout=30.0
+                )
+
+                if response.status_code != 200:
+                    raise Exception(f"API returned status {response.status_code}")
+
+                result = response.json()
+                return result['choices'][0]['message']['content']
+
+        except Exception as e:
+            logging.error(f"Error in analyze_music (attempt {attempt + 1}): {str(e)}")
+            if attempt == retries - 1:
+                return "I apologize, but I'm having trouble processing that request right now. Could you try rephrasing it?"
+            await asyncio.sleep(1)
+
+    return "I apologize, but I'm having trouble processing that request right now. Could you try rephrasing it?"
+
+def log_interaction(source, user_input, response):
+    try:
+        log_data = {
+            "timestamp": str(datetime.datetime.now()),
+            "source": source,
+            "user_input": user_input,
+            "response": response
+        }
+        logging.info(json.dumps(log_data))
+
+        try:
+            with open("interaction_log.json", "a") as log_file:
+                log_file.write(json.dumps(log_data) + "\n")
+        except IOError as e:
+            logging.error(f"Failed to write to JSON log file: {e}")
+    except Exception as e:
+        logging.error(f"Failed to log interaction: {e}")
+
+class ContentScraper:
+    def __init__(self):
+        self.sources = {
+            'jazz': [
+                'https://jazztimes.com/feed',
+                'https://www.allaboutjazz.com/feed',
+                'https://downbeat.com/feed'
+            ],
+            'classical': [
+                'https://www.gramophone.co.uk/feed',
+                'https://www.classical-music.com/feed',
+                'https://www.classicfm.com/feed'
+            ],
+            'world_music': [
+                'https://www.songlines.co.uk/feed',
+                'https://worldmusiccentral.org/feed',
+                'https://www.afropop.org/feed'
+            ],
+            'music_theory': [
+                'https://www.musictheory.net/feed',
+                'https://www.teoria.com/feed',
+                'https://www.musicnotes.com/feed'
+            ]
+        }
+        self.latest_content = defaultdict(list)
+        self.content_cache = {}
+        self.last_update = None
+        self.cache_duration = 3600  # Cache for 1 hour
+
+    async def fetch_content(self, url: str) -> List[Dict]:
+        # Check cache first
+        if url in self.content_cache:
+            cache_time, content = self.content_cache[url]
+            if time.time() - cache_time < self.cache_duration:
+                return content
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                feed = feedparser.parse(response.text)
+
+                articles = []
+                for entry in feed.entries[:5]:
+                    article = {
+                        'title': entry.get('title', ''),
+                        'summary': entry.get('summary', ''),
+                        'link': entry.get('link', ''),
+                        'published': entry.get('published', ''),
+                        'category': self._determine_category(url)
+                    }
+
+                    try:
+                        article_content = Article(article['link'])
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, article_content.download)
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, article_content.parse)
+                        article['full_text'] = article_content.text
+                    except Exception as e:
+                        logging.warning(f"Failed to fetch full text for {article['link']}: {e}")
+                        article['full_text'] = article['summary']
+
+                    articles.append(article)
+
+                # Update cache
+                self.content_cache[url] = (time.time(), articles)
+                return articles
+        except httpx.HTTPError as e:
+            logging.error(f"HTTP Error fetching {url}: {str(e)}")
+            return []
+        except Exception as e:
+            logging.error(f"Unexpected error fetching {url}: {str(e)}")
+            return []
+
+    def _determine_category(self, url: str) -> str:
+        for category, urls in self.sources.items():
+            if url in urls:
+                return category
+        return 'uncategorized'
+
+# Initialize global instance
+scraper = ContentScraper()
+
+# Comprehensive Musical Theory and Analysis Framework
+THEORETICAL_FRAMEWORKS = {
+    'harmonic': {
+        'functional_harmony': {
+            'diatonic': [
+                'primary_functions',
+                'secondary_functions',
+                'tertiary_functions',
+                'applied_dominants',
+                'tonicization_patterns',
+                'deceptive_progressions',
+                'modal_borrowing',
+                'chromatic_mediants',
+                'augmented_sixth_chords',
+                'neapolitan_relationships',
+                'common_tone_modulations',
+                'enharmonic_modulations',
+                'sequential_progressions'
+            ],
+            'extended': [
+                'altered_dominants',
+                'substitute_dominants',
+                'extended_dominants',
+                'backdoor_progressions',
+                'tritone_substitutions',
+                'symmetric_progressions',
+                'constant_structures',
+                'slash_chord_harmony',
+                'polychords',
+                'hybrid_chord_structures'
+            ],
+            'advanced': [
+                'non_functional_harmony',
+                'pandiatonicism',
+                'polytonality',
+                'modal_interchange',
+                'compound_harmony',
+                'harmonic_planing',
+                'chord_multiplication',
+                'pitch_class_sets',
+                'interval_vectors',
+                'harmonic_networks'
+            ]
+        },
+        'modal_systems': {
+            'traditional': [
+                'ecclesiastical_modes',
+                'folk_modes',
+                'pentatonic_systems',
+                'hexatonic_scales',
+                'octatonic_scales',
+                'whole_tone_scales',
+                'synthetic_modes',
+                'altered_modes',
+                'rotational_modes',
+                'compound_modes'
+            ],
+            'jazz_modes': [
+                'bebop_scales',
+                'diminished_scales',
+                'altered_scale',
+                'lydian_augmented',
+                'lydian_dominant',
+                'locrian_natural_2',
+                'superlocrian',
+                'melodic_minor_modes',
+                'harmonic_minor_modes',
+                'double_harmonic_modes',
+                'synthetic_diminished',
+                'whole_tone_dominant',
+                'augmented_scales',
+                'symmetrical_scales',
+                'hybrid_modes'
+            ],
+            'world_music': [
+                'raga_systems',
+                'maqam_modes',
+                'pelog_slendro',
+                'chinese_pentatonic',
+                'african_scales',
+                'persian_dastgah',
+                'japanese_scales',
+                'arabic_maqamat',
+                'turkish_makam',
+                'korean_modes'
+            ]
+        },
+        'advanced_concepts': {
+            'theoretical_systems': [
+                'schenkerian_analysis',
+                'neo_riemannian_theory',
+                'set_theory',
+                'twelve_tone_system',
+                'lydian_chromatic_concept',
+                'tonal_pitch_space',
+                'spectral_harmony',
+                'microtonality',
+                'just_intonation',
+                'xenharmonic_systems'
+            ],
+            'jazz_harmony': [
+                'coltrane_changes',
+                'wayne_shorter_harmony',
+                'bill_evans_harmony',
+                'mccoy_tyner_quartal',
+                'herbie_hancock_voicings',
+                'chick_corea_structures',
+                'modern_jazz_harmony',
+                'post_bop_concepts',
+                'free_jazz_harmony',
+                'contemporary_jazz_harmony'
+            ],
+            'contemporary': [
+                'pitch_centricity',
+                'sound_mass_theory',
+                'spectral_music',
+                'stochastic_composition',
+                'algorithmic_harmony',
+                'cellular_automata',
+                'fractal_harmony',
+                'neural_networks',
+                'ai_generated_systems',
+                'quantum_harmony'
+            ]
+        }
+    },
+    'melodic': {
+        'contrapuntal': {
+            'traditional': [
+                'species_counterpoint',
+                'imitative_counterpoint',
+                'invertible_counterpoint',
+                'double_counterpoint',
+                'triple_counterpoint',
+                'canon_techniques',
+                'fugal_procedures',
+                'motet_techniques',
+                'madrigal_style',
+                'baroque_counterpoint'
+            ],
+            'jazz_linear': [
+                'guide_tone_lines',
+                'voice_leading_patterns',
+                'bebop_lines',
+                'chord_tone_soloing',
+                'approach_note_patterns',
+                'enclosure_patterns',
+                'linear_chromaticism',
+                'thematic_development',
+                'motivic_development',
+                'rhythmic_displacement'
+            ],
+            'advanced': [
+                'polylinear_techniques',
+                'stratification',
+                'heterophony',
+                'micropolyphony',
+                'temporal_counterpoint',
+                'textural_counterpoint',
+                'timbral_counterpoint',
+                'spatial_counterpoint',
+                'electronic_counterpoint',
+                'algorithmic_counterpoint'
+            ]
+        },
+        'improvisational': {
+            'language': [
+                'bebop_vocabulary',
+                'post_bop_language',
+                'modal_concepts',
+                'free_jazz_approaches',
+                'contemporary_techniques',
+                'fusion_elements',
+                'world_music_integration',
+                'electronic_manipulation',
+                'extended_techniques',
+                'hybrid_approaches'
+            ],
+            'conceptual': [
+                'motivic_development',
+                'thematic_transformation',
+                'harmonic_superimposition',
+                'rhythmic_superimposition',
+                'polytonal_improvisation',
+                'outside_playing',
+                'sheets_of_sound',
+                'time_no_changes',
+                'textural_improvisation',
+                'collective_improvisation'
+            ]
+        }
+    },
+    'rhythmic': {
+        'metric_structures': {
+            'traditional': [
+                'simple_meters',
+                'compound_meters',
+                'complex_meters',
+                'mixed_meters',
+                'additive_meters',
+                'irrational_meters',
+                'non_retrogradable_rhythms',
+                'polymeters',
+                'cross_rhythms',
+                'hemiola'
+            ],
+            'world_rhythms': [
+                'indian_tala',
+                'african_polyrhythms',
+                'arabic_iqa',
+                'balkan_meters',
+                'caribbean_rhythms',
+                'brazilian_rhythms',
+                'cuban_clave',
+                'flamenco_compas',
+                'gamelan_structures',
+                'west_african_timelines'
+            ],
+            'contemporary': [
+                'metric_modulation',
+                'temporal_displacement',
+                'rhythmic_serialization',
+                'phase_shifting',
+                'polytempo',
+                'polyrhythmic_layers',
+                'nested_tuplets',
+                'rhythmic_illusions',
+                'metric_superimposition',
+                'temporal_geometry'
+            ]
+        },
+        'time_feel': {
+            'jazz_time': [
+                'swing_feel',
+                'straight_feel',
+                'shuffle_feel',
+                'latin_feel',
+                'funk_feel',
+                'fusion_feel',
+                'broken_feel',
+                'floating_time',
+                'rubato_time',
+                'no_time'
+            ],
+            'expressive_timing': [
+                'micro_timing',
+                'groove_analysis',
+                'rhythmic_inflection',
+                'temporal_elasticity',
+                'phrase_shaping',
+                'articulation_patterns',
+                'accent_patterns',
+                'dynamic_shaping',
+                'temporal_perception',
+                'cognitive_entrainment'
+            ]
+        }
+    }
+}
+
+# Analysis Metrics for evaluating musical sophistication
+ANALYSIS_METRICS = {
+    'theoretical': {
+        'harmonic_sophistication': {
+            'voice_leading_complexity': (1.0, 10.0),
+            'harmonic_rhythm_density': (1.0, 10.0),
+            'chord_extension_usage': (1.0, 10.0),
+            'modulation_complexity': (1.0, 10.0),
+            'vertical_density': (1.0, 10.0),
+            'harmonic_innovation': (1.0, 10.0),
+            'theoretical_integration': (1.0, 10.0),
+            'stylistic_fusion': (1.0, 10.0),
+            'harmonic_ambiguity': (1.0, 10.0),
+            'structural_function': (1.0, 10.0)
+        },
+        'melodic_sophistication': {
+            'linear_complexity': (1.0, 10.0),
+            'motivic_development': (1.0, 10.0),
+            'phrase_structure': (1.0, 10.0),
+            'melodic_contour': (1.0, 10.0),
+            'intervallic_content': (1.0, 10.0),
+            'scale_usage': (1.0, 10.0),
+            'melodic_innovation': (1.0, 10.0),
+            'thematic_transformation': (1.0, 10.0),
+            'linear_coherence': (1.0, 10.0),
+            'expressive_content': (1.0, 10.0)
+        },
+        'rhythmic_sophistication': {
+            'metric_complexity': (1.0, 10.0),
+            'rhythmic_density': (1.0, 10.0),
+            'polyrhythmic_layers': (1.0, 10.0),
+            'temporal_organization': (1.0, 10.0),
+            'groove_complexity': (1.0, 10.0),
+            'rhythmic_innovation': (1.0, 10.0),
+            'metric_modulation': (1.0, 10.0),
+            'temporal_displacement': (1.0, 10.0),
+            'rhythmic_counterpoint': (1.0, 10.0),
+            'temporal_elasticity': (1.0, 10.0)
+        }
+    },
+    'stylistic': {
+        'historical_authenticity': {
+            'medieval': (1.0, 10.0),
+            'renaissance': (1.0, 10.0),
+            'baroque': (1.0, 10.0),
+            'classical': (1.0, 10.0),
+            'romantic': (1.0, 10.0),
+            'modern': (1.0, 10.0),
+            'contemporary': (1.0, 10.0),
+            'postmodern': (1.0, 10.0),
+            'avant_garde': (1.0, 10.0),
+            'experimental': (1.0, 10.0)
+        },
+        'jazz_evolution': {
+            'ragtime': (1.0, 10.0),
+            'early_jazz': (1.0, 10.0),
+            'swing': (1.0, 10.0),
+            'bebop': (1.0, 10.0),
+            'cool': (1.0, 10.0),
+            'hard_bop': (1.0, 10.0),
+            'post_bop': (1.0, 10.0),
+            'free_jazz': (1.0, 10.0),
+            'fusion': (1.0, 10.0),
+            'contemporary_jazz': (1.0, 10.0)
+        },
+        'world_music': {
+            'indian_classical': (1.0, 10.0),
+            'arabic_music': (1.0, 10.0),
+            'african_music': (1.0, 10.0),
+            'gamelan': (1.0, 10.0),
+            'persian_music': (1.0, 10.0),
+            'chinese_music': (1.0, 10.0),
+            'japanese_music': (1.0, 10.0),
+            'korean_music': (1.0, 10.0),
+            'latin_american': (1.0, 10.0),
+            'caribbean': (1.0, 10.0)
+        }
+    },
+    'innovation': {
+        'theoretical_innovation': {
+            'concept_integration': (1.0, 10.0),
+            'system_development': (1.0, 10.0),
+            'cross_cultural_synthesis': (1.0, 10.0),
+            'historical_transformation': (1.0, 10.0),
+            'future_implications': (1.0, 10.0)
+        },
+        'practical_application': {
+            'performance_context': (1.0, 10.0),
+            'pedagogical_value': (1.0, 10.0),
+            'compositional_utility': (1.0, 10.0),
+            'analytical_depth': (1.0, 10.0),
+            'creative_potential': (1.0, 10.0)
+        }
+    }
+}
+
+def format_response_with_insights(response: str, insights: List[Dict[str, Any]], backrooms_data: Dict[str, Any]) -> str:
+    """Format the response text with theoretical insights and backrooms analysis."""
+    formatted = response + "\n\nTheoretical Insights:\n"
+
+    for insight in insights:
+        formatted += f"\n- {insight.get('name', 'Concept')}:\n"
+        formatted += f"  Description: {insight.get('description', '')}\n"
+        if 'theoretical_basis' in insight:
+            formatted += f"  Theoretical Basis: {insight['theoretical_basis'].get('foundations', '')}\n"
+        if 'applications' in insight:
+            formatted += "  Applications:\n"
+            for app in insight['applications']:
+                formatted += f"    - {app}\n"
+
+    # Add backrooms analysis
+    formatted += "\n\nMusical Evolution Analysis:\n"
+    formatted += f"- Theoretical Depth: {backrooms_data['musical_evolution']['theoretical_depth']:.2f}\n"
+    formatted += f"- Development Progress: {backrooms_data['musical_evolution']['development_progress']:.2f}\n"
+    formatted += f"- Breakthroughs: {backrooms_data['musical_evolution']['breakthroughs']}\n"
+
+    if backrooms_data['theoretical_analysis']['frameworks']:
+        formatted += "\nTheoretical Frameworks:\n"
+        for framework in backrooms_data['theoretical_analysis']['frameworks'][-3:]:
+            formatted += f"- {framework.get('development', 'Framework Development')}\n"
+
+    if backrooms_data['theoretical_analysis']['harmonic']:
+        formatted += "\nHarmonic Discoveries:\n"
+        for discovery in backrooms_data['theoretical_analysis']['harmonic'][-3:]:
+            formatted += f"- {discovery.get('discovery', 'Harmonic Discovery')}\n"
+
+    if backrooms_data['theoretical_analysis']['rhythmic']:
+        formatted += "\nRhythmic Innovations:\n"
+        for innovation in backrooms_data['theoretical_analysis']['rhythmic'][-3:]:
+            formatted += f"- {innovation.get('innovation', 'Rhythmic Innovation')}\n"
+
+    return formatted
+
+class Conversation:
+    def __init__(self):
+        self.messages = []
+        self.context = {
+            "current_topic": None,
+            "mentioned_artists": set(),
+            "discussed_concepts": set(),
+            "current_song": None
+        }
+
+    def add_message(self, role: str, content: str):
+        self.messages.append({"role": role, "content": content})
+        # Keep last 10 messages for context
+        if len(self.messages) > 10:
+            self.messages.pop(0)
+
+    def update_context(self, message: str):
+        # Update context based on message content
+        # Extract topics, artists, songs, and concepts
+        if "who is" in message.lower():
+            artist = message.lower().split("who is")[-1].strip()
+            self.context["mentioned_artists"].add(artist)
+            self.context["current_topic"] = f"discussing {artist}"
+        elif "what is" in message.lower():
+            concept = message.lower().split("what is")[-1].strip()
+            self.context["discussed_concepts"].add(concept)
+            self.context["current_topic"] = f"explaining {concept}"
+        elif "play" in message.lower():
+            song = message.lower().split("play")[-1].strip()
+            self.context["current_song"] = song
+            self.context["current_topic"] = f"playing {song}"
+
+    def get_context_for_prompt(self) -> str:
+        context_parts = []
+        if self.context["current_topic"]:
+            context_parts.append(f"Currently {self.context['current_topic']}.")
+        if self.context["current_song"]:
+            context_parts.append(f"We were discussing the song '{self.context['current_song']}'.")
+        if self.context["mentioned_artists"]:
+            artists = ", ".join(list(self.context["mentioned_artists"])[-2:])  # Last 2 artists
+            context_parts.append(f"We talked about {artists}.")
+        if self.context["discussed_concepts"]:
+            concepts = ", ".join(list(self.context["discussed_concepts"])[-2:])  # Last 2 concepts
+            context_parts.append(f"We covered concepts like {concepts}.")
+
+        return " ".join(context_parts)
+
+# Initialize a global conversation manager
+conversation_manager = Conversation()
+
+async def ask_gpt_or_generate_meme(prompt: str, source: str = "unknown", retries: int = 3) -> str:
+    """Main function to handle GPT responses with conversation context."""
+    for attempt in range(retries):
+        try:
+            # Update conversation context
+            conversation_manager.update_context(prompt)
+            conversation_manager.add_message("user", prompt)
+
+            # Get conversation context
+            context = conversation_manager.get_context_for_prompt()
+
+            # Check if this is a backing track generation request
+            is_backing_track = "generating backing track with params" in prompt.lower()
+
+            if is_backing_track:
+                # Handle backing track generation as before
+                params = {}
+                param_matches = re.findall(r"(\w+)=([^,\s]+)", prompt)
+                for key, value in param_matches:
+                    params[key] = value.strip("'\"")
+                musical_request = params.get('prompt', '')
+
+                try:
+                    title = musical_request.split(' in ')[0].strip()
+                    corpus_content = music_analyzer.load_from_corpus(title)
+                    if corpus_content:
+                        return corpus_content
+                except Exception as e:
+                    logging.error(f"Error accessing corpus: {str(e)}")
+
+            # Prepare the message for GPT
+            system_message = f"""You are Bird AI, a friendly and knowledgeable jazz expert with a distinct personality.
+            You're passionate about jazz and love sharing your knowledge. Respond conversationally, as if chatting
+            with a student or fellow musician. Share anecdotes, give practical advice, and maintain a warm,
+            encouraging tone.
+
+            Current conversation context: {context}"""
+
+            # Create the message object
+            message = Message(
+                text=prompt,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *conversation_manager.messages[-5:],  # Include last 5 messages for context
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=500,
+                top_p=1,
+                frequency_penalty=0,
+                presence_penalty=0
+            )
+
+            # Call the internal completion endpoint
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "http://localhost:3000/internal/completion",  # Updated port to 3000
+                    json=message.dict()
+                )
+
+                if response.status_code != 200:
+                    raise Exception(f"Internal completion failed with status {response.status_code}")
+
+                result = response.json()
+                response_text = result['choices'][0]['message']['content']
+
+                # Add response to conversation history
+                conversation_manager.add_message("assistant", response_text)
+
+                return response_text
+
+        except Exception as e:
+            logging.error(f"Error in attempt {attempt + 1}: {str(e)}")
+            if attempt == retries - 1:  # Last attempt
+                raise e
+            await asyncio.sleep(1)  # Wait before retrying
+
+    raise Exception("Failed to get response after all retries")
+
+async def main():
+    print("Bird AI initialized. Type 'exit' or 'quit' to end.")
+
+    try:
+        while True:
+            try:
+                question = input("Ask Bird AI: ").strip()
+                if not question:
+                    continue
+
+                if question.lower() in ['exit', 'quit']:
+                    print("Peace out!")
+                    break
+
+                response = await ask_gpt_or_generate_meme(question, source="terminal")
+
+                if response is not None:
+                    print(f"\n{response}\n")
+                else:
+                    print("\nSomething went wrong. Try asking again.\n")
+
+            except KeyboardInterrupt:
+                print("\nCaught the cosmic wind. Stay groovy!")
+                break
+            except Exception as e:
+                logging.error(f"Error in main loop: {str(e)}")
+                print(f"\nError: {str(e)}\n")
+
+    except Exception as e:
+        logging.error(f"Fatal error: {str(e)}")
+        print(f"Critical error: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+

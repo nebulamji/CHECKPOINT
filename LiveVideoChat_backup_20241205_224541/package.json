@@ -1,0 +1,114 @@
+{
+    "name": "ruby-simli-demo",
+    "private": true,
+    "version": "0.1.0",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "tsc && vite build",
+        "lint": "eslint \"**/*.{js,jsx,ts,tsx}\"",
+        "lint:fix": "eslint \"**/*.{js,jsx,ts,tsx}\" --fix",
+        "format": "prettier --write \"**/*.{json,js,jsx,ts,tsx}\" --log-level warn"
+    },
+    "dependencies": {
+        "@ark-ui/react": "^1.1.0",
+        "@egoist/tailwindcss-icons": "^1.4.0",
+        "@hookform/resolvers": "^3.3.2",
+        "@iconify-json/heroicons": "^1.1.15",
+        "@types/uuid": "^10.0.0",
+        "axios": "^1.7.7",
+        "eventemitter3": "^5.0.1",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "simli-client": "^1.1.0",
+        "uuid": "^10.0.0"
+    },
+    "devDependencies": {
+        "@tailwindcss/aspect-ratio": "^0.4.2",
+        "@tailwindcss/forms": "^0.5.7",
+        "@tailwindcss/typography": "^0.5.10",
+        "@testing-library/react": "^14.1.2",
+        "@types/node": "^20.10.4",
+        "@types/react": "^18.2.42",
+        "@types/react-dom": "^18.2.17",
+        "@typescript-eslint/eslint-plugin": "^6.13.2",
+        "@typescript-eslint/parser": "^6.13.2",
+        "@vitejs/plugin-react": "^4.2.1",
+        "@vitest/ui": "^1.0.2",
+        "autoprefixer": "^10.4.16",
+        "clsx": "^2.0.0",
+        "dotenv-cli": "^7.3.0",
+        "eslint": "^8.55.0",
+        "eslint-config-prettier": "^9.1.0",
+        "eslint-plugin-prettier": "^5.0.1",
+        "eslint-plugin-react": "^7.33.2",
+        "eslint-plugin-simple-import-sort": "^10.0.0",
+        "eslint-plugin-tailwindcss": "^3.13.0",
+        "jsdom": "^23.0.1",
+        "postcss": "^8.4.32",
+        "prettier": "^3.1.0",
+        "prettier-plugin-tailwindcss": "^0.5.9",
+        "tailwind-merge": "^2.1.0",
+        "tailwind-scrollbar": "^3.0.5",
+        "tailwind-variants": "^0.1.18",
+        "tailwindcss": "^3.3.6",
+        "tailwindcss-animate": "^1.0.7",
+        "typescript": "^5.1.6",
+        "vite": "^5.0.6",
+        "vitest": "^1.0.2"
+    },
+    "prettier": {
+        "arrowParens": "always",
+        "bracketSpacing": true,
+        "bracketSameLine": false,
+        "printWidth": 100,
+        "quoteProps": "consistent",
+        "semi": false,
+        "singleQuote": true,
+        "tabWidth": 2,
+        "trailingComma": "es5",
+        "useTabs": false,
+        "overrides": [
+            {
+                "files": [
+                    "*.html",
+                    "*.css",
+                    ".sass"
+                ],
+                "options": {
+                    "singleQuote": false
+                }
+            },
+            {
+                "files": [
+                    "*.json",
+                    "*.rs",
+                    ".prettierrc"
+                ],
+                "options": {
+                    "tabWidth": 4
+                }
+            },
+            {
+                "files": [
+                    "*.jsx",
+                    "*.tsx",
+                    "*.mdx"
+                ],
+                "options": {
+                    "jsxSingleQuote": true
+                }
+            },
+            {
+                "files": [
+                    "Makefile",
+                    "*.mk"
+                ],
+                "options": {
+                    "useTabs": true,
+                    "tabWidth": 4
+                }
+            }
+        ]
+    }
+}

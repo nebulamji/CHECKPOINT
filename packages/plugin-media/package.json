@@ -1,0 +1,17 @@
+{
+    "name": "@ai16z/plugin-media",
+    "version": "0.1.5-alpha.3",
+    "main": "src/index.ts",
+    "type": "module",
+    "scripts": {
+        "build": "tsup --format esm --dts",
+        "check-types": "tsc --noEmit"
+    },
+    "dependencies": {
+        "@ai16z/eliza": "workspace:*"
+    },
+    "devDependencies": {
+        "tsup": "8.0.2",
+        "typescript": "5.4.2"
+    }
+}
